@@ -1,0 +1,55 @@
+[project]
+name = "cell-hypergraphs"
+version = "0.1.0"
+description = "Cell graph / hypergraph methods for TCGA-BRCA histopathology"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    # whole-slide image reading
+    "openslide-python",
+    "openslide-bin",          # bundles the C library, no apt/brew needed
+    # deep learning
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    # graph learning — core (pure python, from PyPI)
+    "torch-geometric",
+    # graph learning — compiled extensions (from PyG's wheel index)
+    "pyg-lib",
+    "torch-scatter",
+    "torch-sparse",
+    "torch-cluster",
+    "torch-spline-conv",
+    # supporting stack
+    "numpy",
+    "pandas",                 # MAF parsing, label tables
+    "pillow",
+    "scikit-image",           # tissue masks, morphology
+    "opencv-python",
+    "matplotlib",
+    "tqdm",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ─── PyTorch CUDA build ───────────────────────────────
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# ─── PyG compiled wheels (flat "find-links" page, matched to torch+cuda) ───
+[[tool.uv.index]]
+name = "pyg"
+url = "https://data.pyg.org/whl/torch-2.8.0+cu128.html"
+format = "flat"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+pyg-lib = { index = "pyg" }
+torch-scatter = { index = "pyg" }
+torch-sparse = { index = "pyg" }
+torch-cluster = { index = "pyg" }
+torch-spline-conv = { index = "pyg" }
