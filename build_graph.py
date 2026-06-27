@@ -126,6 +126,55 @@ def build_knn_graph(centroids, types, k, radius_px):
     return data
 
 
+def build_neighbourhood_hypergraph(centroids, types, k, radius_px):
+    """Build a neighbourhood hypergraph as a PyG Data object.
+
+    The exact higher-order analogue of build_knn_graph: for each cell we form
+    ONE hyperedge containing that cell plus its <=k nearest neighbours within
+    radius_px. So there are N hyperedges (one centred on each cell), and a cell
+    belongs to its own hyperedge plus every neighbour's hyperedge that reaches
+    it -> hyperedges overlap, which is the point.
+
+    Stored in PyG's hypergraph format:
+      hyperedge_index : (2, num_incidences) -- row 0 = node id, row 1 = hyperedge id
+      num_hyperedges  : int (= N here)
+    x / pos / cell_type are identical to the pairwise graph (same node set).
+    """
+    n = len(centroids)
+    pos = torch.tensor(centroids, dtype=torch.float)
+
+    x = torch.zeros((n, N_TYPES), dtype=torch.float)
+    idx_oh = torch.from_numpy(types - 1).long()
+    x[torch.arange(n), idx_oh] = 1.0
+
+    # every cell is in its own hyperedge (hyperedge i is centred on cell i)
+    self_nodes = np.arange(n)
+    self_edges = np.arange(n)
+
+    tree = cKDTree(centroids)
+    kq = min(k + 1, n)
+    if kq < 2:                                  # no neighbours -> singleton hyperedges
+        node_row, edge_row = self_nodes, self_edges
+    else:
+        dist, nbr = tree.query(centroids, k=kq)
+        dist = np.atleast_2d(dist)[:, 1:]       # drop self column
+        nbr = np.atleast_2d(nbr)[:, 1:]
+        keep = (dist <= radius_px).reshape(-1)  # distance cap (also drops inf padding)
+        # hyperedge id for a neighbour incidence = the centre cell's index
+        nbr_edges = np.repeat(np.arange(n), nbr.shape[1])[keep]
+        nbr_nodes = nbr.reshape(-1)[keep]
+        node_row = np.concatenate([self_nodes, nbr_nodes])
+        edge_row = np.concatenate([self_edges, nbr_edges])
+
+    hyperedge_index = torch.from_numpy(np.stack([node_row, edge_row])).long().contiguous()
+
+    data = Data(x=x, pos=pos)
+    data.hyperedge_index = hyperedge_index
+    data.num_hyperedges = n
+    data.cell_type = torch.from_numpy(types).long()
+    return data
+
+
 def microns_to_px(radius_um, mpp):
     return radius_um / mpp
 
@@ -147,8 +196,17 @@ if __name__ == "__main__":
     sub_c, sub_t, (x0, y0) = densest_region(centroids, types, TILE_PX)
     print(f"densest {TILE_PX}px region at ({x0:.0f},{y0:.0f}) has {len(sub_c):,} cells")
 
-    data = build_knn_graph(sub_c, sub_t, K, radius_px)
-    n, e = data.num_nodes, data.num_edges
-    avg_deg = e / n if n else 0
-    print(f"graph: {n:,} nodes | {e:,} directed edges | mean degree {avg_deg:.1f}")
-    print(data)
+    # --- pairwise arm ---
+    g = build_knn_graph(sub_c, sub_t, K, radius_px)
+    nd = g.num_nodes
+    print(f"\n[pairwise]   {nd:,} nodes | {g.num_edges:,} directed edges | "
+          f"mean degree {g.num_edges / nd:.1f}")
+    print("  ", g)
+
+    # --- hypergraph arm (same node set) ---
+    h = build_neighbourhood_hypergraph(sub_c, sub_t, K, radius_px)
+    n_he = h.num_hyperedges
+    n_inc = h.hyperedge_index.shape[1]
+    print(f"\n[hypergraph] {h.num_nodes:,} nodes | {n_he:,} hyperedges | "
+          f"{n_inc:,} incidences | mean hyperedge size {n_inc / n_he:.1f}")
+    print("  ", h)
