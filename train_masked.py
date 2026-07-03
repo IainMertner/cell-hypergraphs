@@ -25,16 +25,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import GCNConv, HypergraphConv
+from torch_geometric.utils import scatter
 
 from build_graph import (
     load_cells, densest_region, microns_to_px,
-    build_knn_graph, build_neighbourhood_hypergraph, N_TYPES,
+    build_knn_graph, build_neighbourhood_hypergraph,
+    build_delaunay_graph, clique_expand, N_TYPES,
 )
+from torch_geometric.data import Data
 
 # ---- config ----
 CELLS_JSON = r"\\wsl$\Ubuntu\home\iain\cellvit\test_out\TCGA-E2-A14P\cells.json"
 TILE_PX = 4000
-K = 10
+K_VALUES = [5]     # k-sweep for k-NN / hypergraph arms (Delaunay is k-free)
 RADIUS_UM = 35.0
 HIDDEN = 32
 EPOCHS = 150
@@ -93,6 +96,62 @@ class HyperGNN(nn.Module):
         return self.head(x)
 
 
+class DeepSetsHyperConv(nn.Module):
+    """Set-aggregation hyperedge layer (node -> hyperedge -> node).
+
+    The point of difference from vanilla HypergraphConv: hyperedge pooling is a
+    SUM (stage 3), not a mean. Sum preserves set-level counts/composition that a
+    clique expansion cannot reconstruct -- this is the mechanism the whole
+    hypergraph hypothesis rests on. Mean would collapse back toward
+    clique-equivalent behaviour.
+
+    Stages:
+      1. phi: per-member MLP on node features (learns what to aggregate)
+      3. sum-pool members -> hyperedge representation (+ explicit set size, so
+         the model can account for size rather than be destabilised by it)
+      4. rho: MLP on the set summary
+      5. scatter hyperedge reps back to member nodes (mean over the hyperedges a
+         node belongs to), then combine with the node's own input feature
+    """
+
+    def __init__(self, in_dim, out_dim, hidden=None):
+        super().__init__()
+        hidden = hidden or out_dim
+        self.phi = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())      # stage 1
+        self.rho = nn.Sequential(nn.Linear(hidden + 1, hidden), nn.ReLU())  # stage 4 (+1 = set size)
+        self.out = nn.Linear(hidden + in_dim, out_dim)                      # stage 5 combine
+
+    def forward(self, x, hyperedge_index, num_hyperedges=None):
+        node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
+        n = x.size(0)
+        if num_hyperedges is None:
+            num_hyperedges = int(edge_idx.max()) + 1
+
+        m = self.phi(x)                                   # (N, hidden)  stage 1
+        msg = m[node_idx]                                 # (M, hidden)  gather members
+        he = scatter(msg, edge_idx, dim=0, dim_size=num_hyperedges, reduce="sum")  # stage 3: SUM
+        size = scatter(torch.ones_like(edge_idx, dtype=x.dtype), edge_idx,
+                       dim=0, dim_size=num_hyperedges, reduce="sum").unsqueeze(1)
+        he = self.rho(torch.cat([he, size.log1p()], dim=1))                # stage 4
+        back = he[edge_idx]                               # (M, hidden)
+        node_msg = scatter(back, node_idx, dim=0, dim_size=n, reduce="mean")  # stage 5: back to nodes
+        return self.out(torch.cat([node_msg, x], dim=1))
+
+
+class DeepSetsHyperGNN(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim):
+        super().__init__()
+        self.c1 = DeepSetsHyperConv(in_dim, hidden)
+        self.c2 = DeepSetsHyperConv(hidden, hidden)
+        self.head = nn.Linear(hidden, out_dim)
+
+    def forward(self, x, hyperedge_index):
+        x = F.relu(self.c1(x, hyperedge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu(self.c2(x, hyperedge_index))
+        return self.head(x)
+
+
 def macro_f1(pred, true, n_classes):
     """Macro-F1 by hand (no sklearn dep). Averages F1 over classes present in `true`."""
     f1s = []
@@ -141,24 +200,46 @@ def main():
     radius_px = microns_to_px(RADIUS_UM, mpp)
     sub_c, sub_t, (x0, y0) = densest_region(centroids, types, TILE_PX)
     n = len(sub_c)
-    print(f"region: {n:,} cells | k={K} | cap {RADIUS_UM}um")
+    print(f"region: {n:,} cells | cap {RADIUS_UM}um | k-sweep {K_VALUES}\n")
 
-    g = build_knn_graph(sub_c, sub_t, K, radius_px)
-    h = build_neighbourhood_hypergraph(sub_c, sub_t, K, radius_px)
+    y = (torch.from_numpy(sub_t).long() - 1)  # 1..5 -> 0..4
 
-    y = (g.cell_type - 1).long()  # 1..5 -> 0..4
-
-    # hide the target cells' features (shared by both arms)
+    # shared hidden set / split across ALL arms and all k
     all_targets, tr, va, te = make_targets(n, MASK_FRAC, SPLIT, SEED)
-    x_input = g.x.clone()
+    x_full = _feats(sub_t, n)
+    x_input = x_full.clone()
     x_input[all_targets] = 0.0
     print(f"hidden {len(all_targets):,} cells "
-          f"(train {len(tr):,} / val {len(va):,} / test {len(te):,})\n")
+          f"(train {len(tr):,} / val {len(va):,} / test {len(te):,})")
 
-    run_arm("pairwise", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
-            x_input, g.edge_index, y, tr, va, te)
-    run_arm("hypergraph", HyperGNN(N_TYPES, HIDDEN, N_TYPES),
-            x_input, h.hyperedge_index, y, tr, va, te)
+    # --- Delaunay baseline (no k, built once) ---
+    d = build_delaunay_graph(sub_c, sub_t, radius_px)
+    print(f"\n=== pw-delaunay (parameter-free baseline) ===")
+    run_arm("pw-delaunay", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
+            x_input, d.edge_index, y, tr, va, te)
+
+    # --- k-dependent arms ---
+    for k in K_VALUES:
+        print(f"\n=== k = {k} ===")
+        g = build_knn_graph(sub_c, sub_t, k, radius_px)
+        h = build_neighbourhood_hypergraph(sub_c, sub_t, k, radius_px)
+        pwc_ei = clique_expand(h.hyperedge_index)
+
+        run_arm("pw-knn", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
+                x_input, g.edge_index, y, tr, va, te)
+        run_arm("pw-clique", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
+                x_input, pwc_ei, y, tr, va, te)
+        run_arm("hg-clique", HyperGNN(N_TYPES, HIDDEN, N_TYPES),
+                x_input, h.hyperedge_index, y, tr, va, te)
+        run_arm("hg-deepsets", DeepSetsHyperGNN(N_TYPES, HIDDEN, N_TYPES),
+                x_input, h.hyperedge_index, y, tr, va, te)
+
+
+def _feats(types, n):
+    """One-hot type node features (shared by all arms)."""
+    x = torch.zeros((n, N_TYPES), dtype=torch.float)
+    x[torch.arange(n), torch.from_numpy(types - 1).long()] = 1.0
+    return x
 
 
 if __name__ == "__main__":

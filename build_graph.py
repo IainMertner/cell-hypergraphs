@@ -20,7 +20,7 @@ Design choices (deliberately simple v1):
 import json
 import numpy as np
 import torch
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, Delaunay
 from torch_geometric.data import Data
 
 # PanNuke taxonomy from CellViT: type indices are 1..5
@@ -173,6 +173,68 @@ def build_neighbourhood_hypergraph(centroids, types, k, radius_px):
     data.num_hyperedges = n
     data.cell_type = torch.from_numpy(types).long()
     return data
+
+
+def _onehot(types, n):
+    x = torch.zeros((n, N_TYPES), dtype=torch.float)
+    x[torch.arange(n), torch.from_numpy(types - 1).long()] = 1.0
+    return x
+
+
+def build_delaunay_graph(centroids, types, radius_px):
+    """Standard Delaunay-triangulation cell graph (order-invariant), distance-capped.
+
+    Parameter-free alternative to k-NN: edges come from the triangulation, then
+    long edges spanning tissue gaps are pruned by radius_px. Same PyG format and
+    same node features as build_knn_graph, so it's a drop-in pairwise baseline.
+    """
+    n = len(centroids)
+    pos = torch.tensor(centroids, dtype=torch.float)
+    x = _onehot(types, n)
+
+    try:
+        tri = Delaunay(centroids)
+        s = tri.simplices                                      # (M, 3) triangles
+        e = np.concatenate([s[:, [0, 1]], s[:, [1, 2]], s[:, [0, 2]]], axis=0)
+        e = np.unique(np.sort(e, axis=1), axis=0)              # undirected, unique
+        d = np.linalg.norm(centroids[e[:, 0]] - centroids[e[:, 1]], axis=1)
+        e = e[d <= radius_px]                                  # distance cap
+        both = np.concatenate([e, e[:, ::-1]], axis=0)         # symmetrise
+        edge_index = torch.from_numpy(both.T).long().contiguous()
+    except Exception:                                          # <4 pts / degenerate
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    data = Data(x=x, pos=pos, edge_index=edge_index)
+    data.cell_type = torch.from_numpy(types).long()
+    return data
+
+
+def clique_expand(hyperedge_index):
+    """Flatten a hypergraph to a pairwise graph: connect all member pairs within
+    each hyperedge. This is the information-matched pairwise CONTROL (pw-clique),
+    not a real-world baseline. Returns a symmetric edge_index.
+    """
+    node = hyperedge_index[0].numpy()
+    edge = hyperedge_index[1].numpy()
+    order = np.argsort(edge, kind="stable")
+    node, edge = node[order], edge[order]
+    _, start, counts = np.unique(edge, return_index=True, return_counts=True)
+
+    src_list, dst_list = [], []
+    for s0, c in zip(start, counts):
+        if c < 2:
+            continue
+        members = node[s0:s0 + c]
+        a = np.repeat(members, c)
+        b = np.tile(members, c)
+        m = a != b                                             # drop self-pairs
+        src_list.append(a[m])
+        dst_list.append(b[m])
+    if not src_list:
+        return torch.empty((2, 0), dtype=torch.long)
+    ei = np.stack([np.concatenate(src_list), np.concatenate(dst_list)])
+    ei = np.unique(ei, axis=1)                                 # dedup overlaps
+    return torch.from_numpy(ei).long().contiguous()
 
 
 def microns_to_px(radius_um, mpp):
