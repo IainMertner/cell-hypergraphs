@@ -38,6 +38,7 @@ from torch_geometric.data import Data
 CELLS_JSON = r"\\wsl$\Ubuntu\home\iain\cellvit\test_out\TCGA-E2-A14P\cells.json"
 TILE_PX = 4000
 K_VALUES = [5]     # k-sweep for k-NN / hypergraph arms (Delaunay is k-free)
+FEATURES = "morph"         # "type" | "morph" | "both" -- node feature set to test
 RADIUS_UM = 35.0
 HIDDEN = 32
 EPOCHS = 150
@@ -194,52 +195,58 @@ def run_arm(name, model, x_input, struct, y, tr, va, te):
     return best
 
 
+def _feats(types, morph, n):
+    """Assemble node features per FEATURES setting. Returns (x, in_dim)."""
+    onehot = torch.zeros((n, N_TYPES), dtype=torch.float)
+    onehot[torch.arange(n), torch.from_numpy(types - 1).long()] = 1.0
+    if FEATURES == "type":
+        return onehot, N_TYPES
+    m = torch.from_numpy(morph).float()
+    if FEATURES == "morph":
+        return m, m.shape[1]
+    return torch.cat([onehot, m], dim=1), N_TYPES + m.shape[1]
+
+
 def main():
     set_seed(SEED)
-    centroids, types, mpp = load_cells(CELLS_JSON)
+    centroids, types, mpp, morph_all = load_cells(CELLS_JSON, with_morphology=True)
     radius_px = microns_to_px(RADIUS_UM, mpp)
-    sub_c, sub_t, (x0, y0) = densest_region(centroids, types, TILE_PX)
+
+    # densest region: derive ONE mask and apply to centroids, types, morph together
+    _, _, (x0, y0) = densest_region(centroids, types, TILE_PX)
+    mask = ((centroids[:, 0] >= x0) & (centroids[:, 0] < x0 + TILE_PX) &
+            (centroids[:, 1] >= y0) & (centroids[:, 1] < y0 + TILE_PX))
+    sub_c, sub_t, sub_m = centroids[mask], types[mask], morph_all[mask]
     n = len(sub_c)
-    print(f"region: {n:,} cells | cap {RADIUS_UM}um | k-sweep {K_VALUES}\n")
+    print(f"region: {n:,} cells | cap {RADIUS_UM}um | k-sweep {K_VALUES} | features={FEATURES}\n")
 
-    y = (torch.from_numpy(sub_t).long() - 1)  # 1..5 -> 0..4
+    y = (torch.from_numpy(sub_t).long() - 1)
+    x_full, in_dim = _feats(sub_t, sub_m, n)
 
-    # shared hidden set / split across ALL arms and all k
     all_targets, tr, va, te = make_targets(n, MASK_FRAC, SPLIT, SEED)
-    x_full = _feats(sub_t, n)
     x_input = x_full.clone()
-    x_input[all_targets] = 0.0
+    x_input[all_targets] = 0.0            # hide target cells (all features)
     print(f"hidden {len(all_targets):,} cells "
           f"(train {len(tr):,} / val {len(va):,} / test {len(te):,})")
 
-    # --- Delaunay baseline (no k, built once) ---
     d = build_delaunay_graph(sub_c, sub_t, radius_px)
-    print(f"\n=== pw-delaunay (parameter-free baseline) ===")
-    run_arm("pw-delaunay", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
+    print(f"\n=== pw-delaunay ===")
+    run_arm("pw-delaunay", PairwiseGNN(in_dim, HIDDEN, N_TYPES),
             x_input, d.edge_index, y, tr, va, te)
 
-    # --- k-dependent arms ---
     for k in K_VALUES:
         print(f"\n=== k = {k} ===")
         g = build_knn_graph(sub_c, sub_t, k, radius_px)
         h = build_neighbourhood_hypergraph(sub_c, sub_t, k, radius_px)
         pwc_ei = clique_expand(h.hyperedge_index)
-
-        run_arm("pw-knn", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
+        run_arm("pw-knn", PairwiseGNN(in_dim, HIDDEN, N_TYPES),
                 x_input, g.edge_index, y, tr, va, te)
-        run_arm("pw-clique", PairwiseGNN(N_TYPES, HIDDEN, N_TYPES),
+        run_arm("pw-clique", PairwiseGNN(in_dim, HIDDEN, N_TYPES),
                 x_input, pwc_ei, y, tr, va, te)
-        run_arm("hg-clique", HyperGNN(N_TYPES, HIDDEN, N_TYPES),
+        run_arm("hg-clique", HyperGNN(in_dim, HIDDEN, N_TYPES),
                 x_input, h.hyperedge_index, y, tr, va, te)
-        run_arm("hg-deepsets", DeepSetsHyperGNN(N_TYPES, HIDDEN, N_TYPES),
+        run_arm("hg-deepsets", DeepSetsHyperGNN(in_dim, HIDDEN, N_TYPES),
                 x_input, h.hyperedge_index, y, tr, va, te)
-
-
-def _feats(types, n):
-    """One-hot type node features (shared by all arms)."""
-    x = torch.zeros((n, N_TYPES), dtype=torch.float)
-    x[torch.arange(n), torch.from_numpy(types - 1).long()] = 1.0
-    return x
 
 
 if __name__ == "__main__":

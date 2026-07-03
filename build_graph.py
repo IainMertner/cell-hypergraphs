@@ -28,10 +28,36 @@ TYPE_MAP = {1: "Neoplastic", 2: "Inflammatory", 3: "Connective", 4: "Dead", 5: "
 N_TYPES = 5
 
 
-def load_cells(path):
-    """Read CellViT cells.json -> centroids (N,2) float, types (N,) int in 1..5, mpp float.
+def _poly_features(contour):
+    """Nuclear shape descriptors from a cell contour (CGC-Net style).
+    Returns [area, perimeter, circularity, eccentricity, extent]."""
+    c = np.asarray(contour, dtype=np.float64)
+    if len(c) < 3:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+    x, y = c[:, 0], c[:, 1]
+    area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    dd = np.diff(c, axis=0, append=c[:1])
+    perim = float(np.sqrt((dd ** 2).sum(1)).sum())
+    circ = 4 * np.pi * area / (perim ** 2) if perim > 0 else 0.0
+    cen = c - c.mean(0)
+    ev = np.linalg.eigvalsh(np.cov(cen.T))
+    ev = np.clip(ev, 1e-9, None)
+    minor, major = 2 * np.sqrt(ev[0]), 2 * np.sqrt(ev[1])
+    ecc = np.sqrt(1 - (minor ** 2) / (major ** 2)) if major > 0 else 0.0
+    bb = (x.max() - x.min()) * (y.max() - y.min())
+    extent = area / bb if bb > 0 else 0.0
+    return [area, perim, circ, ecc, extent]
 
-    Only pulls centroid + type; drops contours/bbox to keep memory small.
+
+N_MORPH = 5  # area, perimeter, circularity, eccentricity, extent
+
+
+def load_cells(path, with_morphology=False):
+    """Read CellViT cells.json -> centroids (N,2), types (N,) in 1..5, mpp.
+
+    If with_morphology=True, also returns a z-scored (N,5) morphology matrix
+    computed from each cell's contour. (One-time loop over all cells; this is
+    the same extraction that will run per-slide in the cohort pipeline.)
     """
     with open(path) as f:
         d = json.load(f)
@@ -41,7 +67,14 @@ def load_cells(path):
         (coord for c in cells for coord in c["centroid"]), dtype=np.float64
     ).reshape(-1, 2)
     types = np.fromiter((c["type"] for c in cells), dtype=np.int64)
-    return centroids, types, mpp
+    if not with_morphology:
+        return centroids, types, mpp
+
+    morph = np.array([_poly_features(c["contour"]) for c in cells], dtype=np.float64)
+    mu, sd = morph.mean(0), morph.std(0)
+    sd[sd == 0] = 1.0
+    morph = (morph - mu) / sd            # z-score each descriptor
+    return centroids, types, mpp, morph
 
 
 def grid_tiles(centroids, tile_px):
