@@ -99,6 +99,20 @@ def cells_in_region(centroids, types, x0, y0, tile_px):
     return centroids[m], types[m]
 
 
+def top_regions(centroids, types, tile_px, n_regions):
+    """Return up to n_regions (mask, (x0,y0), count) for the most populated tiles,
+    sorted densest first. Lets us test whether results reproduce across regions."""
+    scored = []
+    for x0, y0 in grid_tiles(centroids, tile_px):
+        m = ((centroids[:, 0] >= x0) & (centroids[:, 0] < x0 + tile_px) &
+             (centroids[:, 1] >= y0) & (centroids[:, 1] < y0 + tile_px))
+        c = int(m.sum())
+        if c > 0:
+            scored.append((c, x0, y0, m))
+    scored.sort(key=lambda t: -t[0])
+    return [(m, (x0, y0), c) for c, x0, y0, m in scored[:n_regions]]
+
+
 def densest_region(centroids, types, tile_px):
     """Return (sub_centroids, sub_types, (x0,y0)) for the grid tile with most cells.
 
