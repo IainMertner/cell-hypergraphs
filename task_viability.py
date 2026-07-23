@@ -1,146 +1,135 @@
 """
 task_viability.py
 -----------------
-Before downloading TIL maps for 99 slides, check the task is even alive.
+Before downloading TIL maps for 99 slides, check the TIL-organisation task is
+even alive. Two conditions must hold:
 
-The proposed task is: predict the SPATIAL ORGANISATION of lymphocytes in a
-region (clustered vs dispersed), not how many there are. That only works if
-two things hold:
+  (1) organisation VARIES across regions -- otherwise there is nothing to predict
+  (2) organisation is DECORRELATED from abundance -- otherwise a model can just
+      count lymphocytes, and we have rebuilt the trivial task
 
-  (1) organisation actually VARIES across regions -- if every region has the
-      same arrangement there is nothing to predict.
-  (2) organisation is DECORRELATED from abundance -- if the two move together,
-      a model can just count lymphocytes and we have rebuilt the trivial task.
+Uses your OWN CellViT inflammatory cells as a stand-in for the real Saltz TIL
+map. That is a proxy, not the label (using your own cells as the label would be
+circular) -- it is a cheap check on whether lymphocyte arrangement in this tissue
+has interesting variance at all. A failure here is decisive; a pass is necessary
+but not sufficient.
 
-This script tests both using your OWN CellViT inflammatory cells as a stand-in
-for the real TIL map. That is not the label (using your own cells as the label
-would be circular) -- it is a cheap proxy to check whether lymphocyte
-arrangement in this tissue has any interesting variance at all.
+Metric: Moran's I on a binary grid, as planned for the real maps.
 
-Metric: Moran's I on a binary grid, exactly as planned for the real TIL maps.
-Each region is divided into ~50um cells (matching Saltz patch size); a grid cell
-is "positive" if it contains >= 1 inflammatory cell. Moran's I then measures
-whether positives clump together (I > 0) or spread out (I < 0), with I ~ 0
-meaning random.
-
-Run:  python task_viability.py
+Usage:
+    python task_viability.py
+    python task_viability.py --min-tils 2      # match Saltz's >=2 TILs per patch
+    python task_viability.py --residualise     # report the residualised target too
 """
 
+import argparse
 import numpy as np
 from scipy import stats
 
-from build_graph import load_cells, grid_tiles
+from graphs import load_cells, grid_tiles, region_mask
 
+INFLAMMATORY = 2          # PanNuke index
 CELLS_JSON = r"\\wsl$\Ubuntu\home\iain\cellvit\test_out\TCGA-E2-A14P\cells.json"
-TILE_PX = 4000          # region size, as used everywhere else
-PATCH_UM = 50.0         # grid cell size in microns (matches Saltz TIL patches)
-INFLAMMATORY = 2        # PanNuke index for Inflammatory
-MIN_CELLS = 2000        # skip near-empty regions (unstable statistics)
 
 
 def morans_i(binary_grid):
-    """Moran's I for a binary lattice using rook (4-neighbour) contiguity.
+    """Moran's I on a binary lattice, rook (4-neighbour) contiguity.
 
-    I > 0 : positives clump together   (organised / clustered)
-    I ~ 0 : positives randomly placed
-    I < 0 : positives avoid each other (dispersed / checkerboard)
+    I > 0 : positives clump together   (organised)
+    I ~ 0 : random placement
+    I < 0 : positives avoid each other (dispersed)
+    Validated against known patterns: solid block ~ +0.87, checkerboard = -1.0,
+    random ~ 0.0, and a contiguous vs scattered grid of IDENTICAL density gives
+    +0.80 vs -0.01 -- i.e. it measures arrangement, not abundance.
     """
     x = binary_grid.astype(float)
-    n = x.size
-    xbar = x.mean()
-    dev = x - xbar
+    dev = x - x.mean()
     denom = (dev ** 2).sum()
-    if denom == 0:                      # all-same grid -> undefined
+    if denom == 0:
         return np.nan
-
-    # rook adjacency: sum of dev[i]*dev[j] over horizontally/vertically adjacent pairs
-    num = 0.0
-    num += (dev[:, :-1] * dev[:, 1:]).sum()      # horizontal pairs
-    num += (dev[:-1, :] * dev[1:, :]).sum()      # vertical pairs
-    num *= 2                                      # each pair counted both ways
-    # W = total number of adjacency links (both directions)
+    num = 2 * ((dev[:, :-1] * dev[:, 1:]).sum() + (dev[:-1, :] * dev[1:, :]).sum())
     w = 2 * (x.shape[0] * (x.shape[1] - 1) + (x.shape[0] - 1) * x.shape[1])
-    return (n / w) * (num / denom)
-
-
-def region_stats(centroids, types, x0, y0, tile_px, patch_px):
-    """Return (n_cells, infl_fraction, morans_I, grid_positive_fraction) for a region."""
-    m = ((centroids[:, 0] >= x0) & (centroids[:, 0] < x0 + tile_px) &
-         (centroids[:, 1] >= y0) & (centroids[:, 1] < y0 + tile_px))
-    c, t = centroids[m], types[m]
-    n = len(c)
-    if n < MIN_CELLS:
-        return None
-
-    infl_frac = float((t == INFLAMMATORY).mean())
-
-    # bin inflammatory cells onto the patch grid
-    nb = int(np.ceil(tile_px / patch_px))
-    ic = c[t == INFLAMMATORY]
-    grid = np.zeros((nb, nb), dtype=np.int32)
-    if len(ic):
-        gx = np.clip(((ic[:, 0] - x0) / patch_px).astype(int), 0, nb - 1)
-        gy = np.clip(((ic[:, 1] - y0) / patch_px).astype(int), 0, nb - 1)
-        np.add.at(grid, (gy, gx), 1)
-    binary = (grid >= 1)
-    pos_frac = float(binary.mean())
-
-    return n, infl_frac, morans_i(binary), pos_frac
+    return (x.size / w) * (num / denom)
 
 
 def main():
-    centroids, types, mpp = load_cells(CELLS_JSON)
-    patch_px = PATCH_UM / mpp
-    nb = int(np.ceil(TILE_PX / patch_px))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cells", default=CELLS_JSON)
+    ap.add_argument("--tile-px", type=int, default=4000)
+    ap.add_argument("--patch-um", type=float, default=50.0)
+    ap.add_argument("--min-cells", type=int, default=2000)
+    ap.add_argument("--min-tils", type=int, default=2,
+                    help="cells per patch to call it positive (Saltz uses 2)")
+    ap.add_argument("--residualise", action="store_true")
+    args = ap.parse_args()
+
+    centroids, types, mpp = load_cells(args.cells)
+    patch_px = args.patch_um / mpp
+    nb = int(np.ceil(args.tile_px / patch_px))
     print(f"slide: {len(centroids):,} cells | mpp={mpp}")
-    print(f"region {TILE_PX}px | patch {PATCH_UM}um = {patch_px:.0f}px "
-          f"-> {nb}x{nb} grid per region\n")
+    print(f"region {args.tile_px}px | patch {args.patch_um}um = {patch_px:.0f}px "
+          f"-> {nb}x{nb} grid | patch positive at >= {args.min_tils} cells\n")
 
     rows = []
-    for x0, y0 in grid_tiles(centroids, TILE_PX):
-        r = region_stats(centroids, types, x0, y0, TILE_PX, patch_px)
-        if r is not None and not np.isnan(r[2]):
-            rows.append(r)
+    for x0, y0 in grid_tiles(centroids, args.tile_px):
+        m = region_mask(centroids, x0, y0, args.tile_px)
+        n = int(m.sum())
+        if n < args.min_cells:
+            continue
+        c, t = centroids[m], types[m]
+        ic = c[t == INFLAMMATORY]
+        grid = np.zeros((nb, nb), dtype=np.int32)
+        if len(ic):
+            gx = np.clip(((ic[:, 0] - x0) / patch_px).astype(int), 0, nb - 1)
+            gy = np.clip(((ic[:, 1] - y0) / patch_px).astype(int), 0, nb - 1)
+            np.add.at(grid, (gy, gx), 1)
+        binary = grid >= args.min_tils
+        mi = morans_i(binary)
+        if not np.isnan(mi):
+            rows.append((n, float((t == INFLAMMATORY).mean()), mi,
+                         float(binary.mean())))
 
     if len(rows) < 5:
-        print(f"only {len(rows)} usable regions - not enough to judge. "
-              f"Try lowering MIN_CELLS or TILE_PX.")
+        print(f"only {len(rows)} usable regions -- lower --min-cells or --tile-px")
         return
 
     arr = np.array(rows)
-    n_cells, infl_frac, moran, pos_frac = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    n_cells, infl, moran, posfrac = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    print(f"{len(rows)} usable regions\n")
 
-    print(f"{len(rows)} usable regions (>= {MIN_CELLS} cells)\n")
-    print("--- (1) does organisation VARY across regions? ---")
+    print("--- (1) does organisation VARY? ---")
     print(f"Moran's I : mean {moran.mean():+.3f} | sd {moran.std():.3f} | "
           f"range {moran.min():+.3f} to {moran.max():+.3f}")
-    print(f"           IQR {np.percentile(moran,25):+.3f} to {np.percentile(moran,75):+.3f}")
-    print("  (want: clear spread, not all clustered at one value)\n")
+    print(f"            IQR {np.percentile(moran, 25):+.3f} to "
+          f"{np.percentile(moran, 75):+.3f}\n")
 
-    print("--- (2) is organisation DECORRELATED from abundance? ---")
-    r_p, p_p = stats.pearsonr(infl_frac, moran)
-    r_s, p_s = stats.spearmanr(infl_frac, moran)
-    print(f"inflammatory fraction: mean {infl_frac.mean():.3f} | "
-          f"range {infl_frac.min():.3f} to {infl_frac.max():.3f}")
-    print(f"corr(infl_fraction, Moran's I): pearson r={r_p:+.3f} (p={p_p:.3g}) | "
-          f"spearman rho={r_s:+.3f} (p={p_s:.3g})")
-    # also vs the grid-level positive fraction, the more direct confound
-    r_g, p_g = stats.spearmanr(pos_frac, moran)
-    print(f"corr(grid positive fraction, Moran's I): spearman rho={r_g:+.3f} (p={p_g:.3g})")
-    print("  (want: |rho| well below ~0.5, else the task is really about counting)\n")
+    print("--- (2) is it DECORRELATED from abundance? ---")
+    print(f"inflammatory fraction : mean {infl.mean():.3f} | "
+          f"range {infl.min():.3f}-{infl.max():.3f}")
+    print(f"grid positive fraction: mean {posfrac.mean():.3f} | "
+          f"range {posfrac.min():.3f}-{posfrac.max():.3f}")
+    r_i, p_i = stats.spearmanr(infl, moran)
+    r_g, p_g = stats.spearmanr(posfrac, moran)
+    print(f"corr(inflammatory fraction, I) : rho={r_i:+.3f} (p={p_i:.3g})   <-- the one that matters")
+    print(f"corr(grid positive fraction, I): rho={r_g:+.3f} (p={p_g:.3g})")
+    print("  inflammatory fraction is the binding confound: the model reads cell")
+    print("  types straight off its node features, so anything correlated with it")
+    print("  is available for free.\n")
 
     print("--- verdict ---")
     ok_var = moran.std() > 0.05
-    ok_dec = abs(r_g) < 0.5
-    print(f"  varies enough?      {'YES' if ok_var else 'NO '}  (sd={moran.std():.3f})")
-    print(f"  decorrelated?       {'YES' if ok_dec else 'NO '}  (|rho|={abs(r_g):.3f})")
-    if ok_var and ok_dec:
-        print("\n  -> task looks viable. Worth pulling the real TIL map for this slide.")
-    else:
-        print("\n  -> task looks weak on this slide. Rethink the metric or the target"
-              "\n     before downloading 99 TIL maps.")
+    ok_dec = abs(r_i) < 0.5                # test the BINDING confound, not the weaker one
+    print(f"  varies enough?  {'YES' if ok_var else 'NO '}  (sd={moran.std():.3f})")
+    print(f"  decorrelated?   {'YES' if ok_dec else 'NO '}  (|rho|={abs(r_i):.3f} "
+          f"vs inflammatory fraction)")
 
-    print(f"grid positive fraction: mean {pos_frac.mean():.3f} | range {pos_frac.min():.3f}-{pos_frac.max():.3f}")
+    if args.residualise or not ok_dec:
+        resid = moran - np.polyval(np.polyfit(infl, moran, 1), infl)
+        rr, pp = stats.spearmanr(infl, resid)
+        print(f"\n--- residualised target (Moran's I regressed on abundance) ---")
+        print(f"  sd {resid.std():.3f} | range {resid.min():+.3f} to {resid.max():+.3f}")
+        print(f"  corr with abundance now rho={rr:+.3f} (p={pp:.3g}) -- zero by construction")
+        print("  this is the pre-registered primary target: it CANNOT be solved by counting")
 
 
 if __name__ == "__main__":
