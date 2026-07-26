@@ -3,28 +3,25 @@ train_patterns.py
 -----------------
 Task 1 (real): predict the Saltz TIL PatternLabel of a slide from its cells.
 
+STAGE 2 of the split pipeline. Loads region graphs precomputed by
+precompute_graphs.py rather than rebuilding them -- so this runs in minutes and
+can be re-run freely across tasks, seeds, arms, and capacity regimes.
+
 Labels are SLIDE-LEVEL (one per slide), so this is multiple-instance learning:
-each slide is a bag of region graphs, aggregated to a slide prediction. See
-mil.py for the models.
+each slide is a bag of region graphs, aggregated to a slide prediction (see
+mil.py). The four labels decompose into a briskness (abundance) axis and an
+arrangement (spatial) axis; --task arrangement isolates the spatial axis, which
+is the part higher-order structure should help with and abundance cannot explain.
+The AbundanceOnly control must be cleared before any spatial claim is made.
 
-The four labels decompose along two axes:
-    briskness (abundance): Brisk {Diffuse, Band-like} vs Non-Brisk {Focal, Multifocal}
-    arrangement (spatial): how the lymphocytes are organised
-The abundance axis is exactly what a counting model captures, so the AbundanceOnly
-control matters: if it does as well as the graph arms, the task reduced to counting
-and no spatial claim survives. --task arrangement collapses to the spatial axis
-only, which is the part higher-order structure should actually help with.
-
-Slide-level means ~n_slides labels (small), so treat results as a debugging /
-scaffolding run until the region-level maps arrive. MIL, class encoding, the
-abundance control, splitting by slide, and Spearman/accuracy plumbing are all
-reused by the later tasks, so this is not throwaway work.
+Slide-level means small n -- treat as scaffolding / a first real test until the
+region-level maps arrive.
 
 Usage:
-    python train_patterns.py --labels til_indices.csv --cache-root cellvit_out/
-    python train_patterns.py --task arrangement          # binary spatial axis
-    python train_patterns.py --arms pw-knn hg-knn         # subset of arms
-    python train_patterns.py --seeds 10
+    python precompute_graphs.py --cache-root cellvit_out --out graph_cache   # once
+    python train_patterns.py --graph-cache graph_cache --labels til_indices.csv
+    python train_patterns.py --graph-cache graph_cache --labels til_indices.csv \
+        --task arrangement --arms pw-knn hg-knn --seeds 10
 """
 
 import argparse
@@ -35,21 +32,14 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from graphs import build, load_cache, regions as find_regions, region_mask, N_TYPES, STAGE1
-from models import set_seed, matched_hidden, n_params, PairwiseGNN, DeepSetsHyperGNN
+from graphs import N_TYPES, STAGE1
+from models import set_seed, matched_hidden, n_params
 from mil import MILClassifier, AbundanceOnly, PairwiseRegionEncoder, HyperRegionEncoder
 
 # 4-way and the collapsed spatial-only ("arrangement") mapping
 CLASSES4 = ["Brisk Diffuse", "Brisk Band-like", "Non-Brisk Focal", "Non-Brisk Multifocal"]
-# arrangement axis: is the infiltrate localised (focal/multifocal) or spread
-# (diffuse/band-like)?  This is the distinction abundance cannot explain.
 ARRANGEMENT = {"Brisk Diffuse": "spread", "Brisk Band-like": "spread",
                "Non-Brisk Focal": "localised", "Non-Brisk Multifocal": "localised"}
-
-
-def slide_id_from_cache(path):
-    """cellvit_out/<SLIDE_ID>/cells_cache.npz -> SLIDE_ID"""
-    return os.path.basename(os.path.dirname(path))
 
 
 def load_labels(csv_path, task):
@@ -65,46 +55,6 @@ def load_labels(csv_path, task):
         classes = CLASSES4
     idx = {c: i for i, c in enumerate(classes)}
     return dict(zip(df.SlideID, df.y.map(idx))), classes
-
-
-def build_slide_bag(cache_path, arms, tile_px, min_cells, min_infl):
-    """Load one slide's cache, tile it, build every arm's graph per region.
-
-    Region selection is VALIDITY-based, not capped: keep every region with
-    enough total cells AND enough inflammatory cells to have a meaningful immune
-    arrangement. No densest-N cap (that biases toward tumour-dense regions, which
-    is exactly where focal TILs are NOT). Sparse / immune-poor regions are
-    dropped because the arrangement label is undefined there, not to save compute
-    -- they are cheap anyway.
-
-    Returns dict: arm -> list of (x, struct) region graphs, plus the slide-level
-    abundance feature vector for the control.
-    """
-    centroids, types, mpp, morph = load_cache(cache_path)
-    regs = find_regions(centroids, tile_px, min_cells)          # no top_n cap
-    if not regs:
-        return None, None
-
-    bags = {a: [] for a in arms}
-    kept = 0
-    for mask, _, _ in regs:
-        c, t, m = centroids[mask], types[mask], morph[mask]
-        if int((t == 2).sum()) < min_infl:                     # 2 = Inflammatory
-            continue                                            # arrangement undefined
-        kept += 1
-        for a in arms:
-            d = build(a, c, t, mpp, morph=m)
-            struct = d.edge_index if a.startswith("pw-") else d.hyperedge_index
-            bags[a].append((d.x, struct))
-
-    if kept == 0:                                              # no valid region
-        return None, None
-
-    # slide-level abundance feature: overall type fractions + log total count
-    frac = np.array([(types == k).mean() for k in range(1, N_TYPES + 1)])
-    abund = torch.tensor(np.concatenate([frac, [np.log1p(len(types))]]),
-                         dtype=torch.float)
-    return bags, abund
 
 
 def train_eval_mil(model, bags, labels_t, tr, va, te, epochs, lr, seed,
@@ -141,14 +91,11 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, epochs, lr, seed,
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--graph-cache", default="graph_cache",
+                    help="dir of precomputed per-slide graphs (precompute_graphs.py)")
     ap.add_argument("--labels", required=True)
-    ap.add_argument("--cache-root", default="cellvit_out")
     ap.add_argument("--task", choices=["pattern4", "arrangement"], default="pattern4")
     ap.add_argument("--arms", nargs="*", default=[a for a in STAGE1 if a != "hg-knn+semantic"])
-    ap.add_argument("--tile-px", type=int, default=4000)
-    ap.add_argument("--min-cells", type=int, default=2000)
-    ap.add_argument("--min-infl", type=int, default=50,
-                    help="min inflammatory cells for a region to have a defined arrangement")
     ap.add_argument("--hidden", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--seeds", type=int, default=5)
@@ -156,37 +103,41 @@ def main():
     args = ap.parse_args()
 
     labels, classes = load_labels(args.labels, args.task)
-    print(f"task={args.task} | {len(classes)} classes: {classes}")
+    n_classes = len(classes)
+    print(f"task={args.task} | {n_classes} classes: {classes}")
 
-    # match processed slides to labels
-    caches = glob.glob(os.path.join(args.cache_root, "*", "cells_cache.npz"))
-    matched = [(p, slide_id_from_cache(p)) for p in caches
-               if slide_id_from_cache(p) in labels]
-    print(f"{len(caches)} slides segmented | {len(matched)} have a label")
-    if len(matched) < 10:
-        print("too few labelled slides to train meaningfully yet -- come back when"
-              " more of the cohort has segmented.")
-        return
+    cache_params = torch.load(os.path.join(args.graph_cache, "_params.pt"))
+    print(f"graph cache: k={cache_params['k']}, "
+          f"hg_radius_um={cache_params['hg_radius_um']}, "
+          f"min_infl={cache_params['min_infl']}")
+    for a in args.arms:
+        if a not in cache_params["arms"]:
+            raise ValueError(f"arm {a!r} not in graph cache "
+                             f"(cached: {cache_params['arms']}); rerun precompute")
 
-    # build every slide's bag once
-    print("building slide bags...")
+    # load every cached slide that has a label
+    files = [f for f in sorted(glob.glob(os.path.join(args.graph_cache, "*.pt")))
+             if not f.endswith("_params.pt")]
     slide_bags, slide_abund, y = [], [], []
-    for path, sid in matched:
-        bags, abund = build_slide_bag(path, args.arms, args.tile_px,
-                                      args.min_cells, args.min_infl)
-        if bags is None:
+    for f in files:
+        sid = os.path.basename(f)[:-3]
+        if sid not in labels:
             continue
-        slide_bags.append(bags)
-        slide_abund.append(abund)
+        d = torch.load(f)
+        slide_bags.append(d["bags"])
+        slide_abund.append(d["abundance"])
         y.append(labels[sid])
     n = len(y)
+    print(f"{len(files)} cached slides | {n} have a label")
+    if n < 10:
+        print("too few labelled slides to train meaningfully.")
+        return
+
     y = torch.tensor(y).long()
     abund = torch.stack(slide_abund)
-    print(f"{n} usable slides | class counts "
-          f"{ {c: int((y == i).sum()) for i, c in enumerate(classes)} }\n")
+    print(f"class counts { {c: int((y == i).sum()) for i, c in enumerate(classes)} }\n")
 
     in_dim = slide_bags[0][args.arms[0]][0][0].shape[1]
-    n_classes = len(classes)
 
     # capacity: match pairwise region-encoder params to the hypergraph one
     target = n_params(HyperRegionEncoder(in_dim, args.hidden))
