@@ -58,34 +58,50 @@ def load_labels(csv_path, task):
 
 
 def train_eval_mil(model, bags, labels_t, tr, va, te, epochs, lr, seed,
-                   abundance=None):
-    """Train one arm (or the abundance control) and return best-val test accuracy."""
+                   abundance=None, device="cpu", patience=20):
+    """Train one arm (or the abundance control), return best-val test accuracy.
+
+    Early stopping: if validation accuracy has not improved for `patience`
+    epochs, stop -- so we do not pay 100 epochs when the model converged at 30.
+    Moves the model (and per-sample tensors) to `device`; GPU is dramatically
+    faster for the message-passing that dominates cost.
+    """
     set_seed(seed)
+    model = model.to(device)
+    labels_t = labels_t.to(device)
+    if abundance is not None:
+        abundance = abundance.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
-    best_val, best_test = -1.0, 0.0
+
+    def run(i):
+        if abundance is not None:
+            return model(abundance[i])
+        # move this slide's region graphs to the device on demand
+        bag = [(x.to(device), s.to(device)) for x, s in bags[i]]
+        return model(bag)[0]
+
+    best_val, best_test, since = -1.0, 0.0, 0
     for _ in range(epochs):
         model.train()
         opt.zero_grad()
         loss = 0.0
         for i in tr:
-            out = (model(abundance[i]) if abundance is not None
-                   else model(bags[i])[0])
-            loss = loss + F.cross_entropy(out.unsqueeze(0), labels_t[i:i + 1])
+            loss = loss + F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1])
         (loss / len(tr)).backward()
         opt.step()
 
         model.eval()
         with torch.no_grad():
             def acc(idx):
-                preds = []
-                for i in idx:
-                    out = (model(abundance[i]) if abundance is not None
-                           else model(bags[i])[0])
-                    preds.append(int(out.argmax()))
-                return float(np.mean([p == int(labels_t[i]) for p, i in zip(preds, idx)]))
-            va_acc, te_acc = acc(va), acc(te)
+                return float(np.mean([int(run(i).argmax()) == int(labels_t[i])
+                                      for i in idx]))
+            va_acc = acc(va)
             if va_acc > best_val:
-                best_val, best_test = va_acc, te_acc
+                best_val, best_test, since = va_acc, acc(te), 0
+            else:
+                since += 1
+                if since >= patience:
+                    break
     return best_test
 
 
@@ -100,6 +116,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--split", type=float, nargs=3, default=[0.6, 0.2, 0.2])
+    ap.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     labels, classes = load_labels(args.labels, args.task)
@@ -157,7 +174,7 @@ def main():
     print("=== arms (test accuracy, mean +- sd over seeds) ===")
     ab_scores = [train_eval_mil(AbundanceOnly(abund.shape[1], 32, n_classes),
                                 None, y, tr, va, te, args.epochs, 0.01, s,
-                                abundance=abund) for s in range(args.seeds)]
+                                abundance=abund, device=args.device) for s in range(args.seeds)]
     print(f"  {'abundance-only':<18} {np.mean(ab_scores):.3f} +- {np.std(ab_scores):.3f}")
 
     for arm in args.arms:
@@ -167,7 +184,7 @@ def main():
             set_seed(s)
             model = MILClassifier(arm, in_dim, hidden[arm], n_classes)
             scores.append(train_eval_mil(model, bags_for_arm, y, tr, va, te,
-                                         args.epochs, 0.01, s))
+                                         args.epochs, 0.01, s, device=args.device))
         print(f"  {arm:<18} {np.mean(scores):.3f} +- {np.std(scores):.3f}")
 
     print(f"\nmajority-class baseline: "
