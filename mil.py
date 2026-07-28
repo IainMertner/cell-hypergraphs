@@ -86,7 +86,7 @@ def pack_pairwise(region_graphs):
     for r, (x, ei) in enumerate(region_graphs):
         xs.append(x)
         eis.append(ei + node_off)
-        batch.append(torch.full((x.size(0),), r, dtype=torch.long))
+        batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=x.device))
         node_off += x.size(0)
     return (torch.cat(xs, 0), torch.cat(eis, 1),
             torch.cat(batch), len(region_graphs))
@@ -106,7 +106,7 @@ def pack_hyper(region_graphs):
             h[1] += edge_off
             his.append(h)
             edge_off += int(hi[1].max()) + 1
-        batch.append(torch.full((x.size(0),), r, dtype=torch.long))
+        batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=x.device))
         node_off += x.size(0)
     hyperedge_index = (torch.cat(his, 1) if his
                        else torch.empty((2, 0), dtype=torch.long))
