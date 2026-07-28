@@ -86,7 +86,7 @@ def pack_pairwise(region_graphs):
     for r, (x, ei) in enumerate(region_graphs):
         xs.append(x)
         eis.append(ei + node_off)
-        batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=x.device))
+        batch.append(torch.full((x.size(0),), r, dtype=torch.long))
         node_off += x.size(0)
     return (torch.cat(xs, 0), torch.cat(eis, 1),
             torch.cat(batch), len(region_graphs))
@@ -106,7 +106,7 @@ def pack_hyper(region_graphs):
             h[1] += edge_off
             his.append(h)
             edge_off += int(hi[1].max()) + 1
-        batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=x.device))
+        batch.append(torch.full((x.size(0),), r, dtype=torch.long))
         node_off += x.size(0)
     hyperedge_index = (torch.cat(his, 1) if his
                        else torch.empty((2, 0), dtype=torch.long))
@@ -132,27 +132,48 @@ class AttentionMIL(nn.Module):
 
 
 class MILClassifier(nn.Module):
-    """Region encoder (batched) + attention pool + linear head. One per arm."""
+    """Region encoder (minibatched) + attention pool + linear head. One per arm.
 
-    def __init__(self, arm, in_dim, hidden, n_classes, pool="attention"):
+    Regions are encoded in GROUPS of `regions_per_batch` rather than all at once.
+    Full-slide batching put every region's nodes on the GPU simultaneously, which
+    OOMs on large slides with high-cardinality hypergraph constructions. Grouping
+    caps peak memory at group-size while keeping most of the batching speedup.
+
+    Region boundaries are never split (whole regions per group), so per-region
+    vectors are identical to full-batch or per-region encoding. The group vectors
+    are concatenated WITHOUT detaching, so gradients flow through every group and
+    training is unchanged.
+    """
+
+    def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
+                 regions_per_batch=16):
         super().__init__()
         self.arm = arm
         self.is_pw = arm.startswith("pw-")
         self.encoder = (PairwiseRegionEncoder(in_dim, hidden) if self.is_pw
                         else HyperRegionEncoder(in_dim, hidden))
         self.pool_kind = pool
+        self.rpb = regions_per_batch
         if pool == "attention":
             self.pool = AttentionMIL(self.encoder.out_dim)
         self.head = nn.Linear(self.encoder.out_dim, n_classes)
 
+    def _encode_regions(self, bag_graphs):
+        """Encode all regions to (R, 2*hidden), in memory-bounded groups."""
+        vecs = []
+        for i in range(0, len(bag_graphs), self.rpb):
+            group = bag_graphs[i:i + self.rpb]
+            if self.is_pw:
+                x, ei, batch, R = pack_pairwise(group)
+                vecs.append(self.encoder(x, ei, batch, R))
+            else:
+                x, hi, batch, R, n_he = pack_hyper(group)
+                vecs.append(self.encoder(x, hi, batch, R, n_he))
+        return torch.cat(vecs, dim=0)          # attached: gradients flow through all groups
+
     def forward(self, bag_graphs):
         """bag_graphs: list of (x, struct) region tuples for one slide."""
-        if self.is_pw:
-            x, ei, batch, R = pack_pairwise(bag_graphs)
-            region_vecs = self.encoder(x, ei, batch, R)
-        else:
-            x, hi, batch, R, n_he = pack_hyper(bag_graphs)
-            region_vecs = self.encoder(x, hi, batch, R, n_he)
+        region_vecs = self._encode_regions(bag_graphs)
         if self.pool_kind == "attention":
             slide_vec, att = self.pool(region_vecs)
         else:

@@ -58,25 +58,27 @@ def load_labels(csv_path, task):
 
 
 def train_eval_mil(model, bags, labels_t, tr, va, te, epochs, lr, seed,
-                   abundance=None, device="cpu", patience=20):
-    """Train one arm (or the abundance control), return best-val test accuracy.
+                   abundance=None, device="cpu", patience=20, class_weight=None):
+    """Train one arm on train fold `tr`, early-stop on val `va`, score test `te`.
 
-    Early stopping: if validation accuracy has not improved for `patience`
-    epochs, stop -- so we do not pay 100 epochs when the model converged at 30.
-    Moves the model (and per-sample tensors) to `device`; GPU is dramatically
-    faster for the message-passing that dominates cost.
+    class_weight: per-class loss weights (inverse frequency) so the model is not
+    rewarded for collapsing to the majority class -- essential with imbalanced
+    labels, where plain cross-entropy sits at the majority predictor.
+    Early stopping uses the VAL fold only, never the test fold, so test stays
+    untouched until the final read.
     """
     set_seed(seed)
     model = model.to(device)
     labels_t = labels_t.to(device)
     if abundance is not None:
         abundance = abundance.to(device)
+    if class_weight is not None:
+        class_weight = class_weight.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
 
     def run(i):
         if abundance is not None:
             return model(abundance[i])
-        # move this slide's region graphs to the device on demand
         bag = [(x.to(device), s.to(device)) for x, s in bags[i]]
         return model(bag)[0]
 
@@ -86,10 +88,10 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, epochs, lr, seed,
         opt.zero_grad()
         loss = 0.0
         for i in tr:
-            loss = loss + F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1])
+            loss = loss + F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1],
+                                          weight=class_weight)
         (loss / len(tr)).backward()
         opt.step()
-
         model.eval()
         with torch.no_grad():
             def acc(idx):
@@ -105,6 +107,44 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, epochs, lr, seed,
     return best_test
 
 
+def _make_folds(y, patient, k, seed=0):
+    """Patient-grouped, stratified k-fold. Returns list of (train, val, test) idx.
+
+    Grouped: all of a patient's slides go to the same fold (no same-patient
+    leakage across train/test). Stratified: folds balanced by class as far as the
+    grouping allows -- patients are assigned to folds greedily in class order so
+    each fold gets a similar class mix. A val set is carved from each training
+    fold for early stopping, so the test fold is never seen during training.
+    """
+    rng = np.random.default_rng(seed)
+    # one representative label per patient (its most common slide label)
+    pats = {}
+    for i, p in enumerate(patient):
+        pats.setdefault(p, []).append(i)
+    plist = list(pats)
+    plabel = {p: np.bincount([y[i] for i in pats[p]]).argmax() for p in plist}
+
+    # assign patients to folds, balancing classes: for each class, round-robin
+    # its patients across folds
+    fold_of = {}
+    for c in sorted(set(plabel.values())):
+        cp = [p for p in plist if plabel[p] == c]
+        rng.shuffle(cp)
+        for j, p in enumerate(cp):
+            fold_of[p] = j % k
+
+    folds = []
+    for f in range(k):
+        te = [i for p in plist if fold_of[p] == f for i in pats[p]]
+        trainval = [i for p in plist if fold_of[p] != f for i in pats[p]]
+        # carve a val set: hold out one other fold's patients for validation
+        val_fold = (f + 1) % k
+        va = [i for p in plist if fold_of[p] == val_fold for i in pats[p]]
+        tr = [i for i in trainval if i not in set(va)]
+        folds.append((np.array(tr), np.array(va), np.array(te)))
+    return folds
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--graph-cache", default="graph_cache",
@@ -116,7 +156,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--split", type=float, nargs=3, default=[0.6, 0.2, 0.2])
+    ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
+    ap.add_argument("--regions-per-batch", type=int, default=16,
+                    help="regions encoded per GPU pass; lower if OOM on big slides")
     args = ap.parse_args()
 
     labels, classes = load_labels(args.labels, args.task)
@@ -132,10 +175,9 @@ def main():
             raise ValueError(f"arm {a!r} not in graph cache "
                              f"(cached: {cache_params['arms']}); rerun precompute")
 
-    # load every cached slide that has a label
     files = [f for f in sorted(glob.glob(os.path.join(args.graph_cache, "*.pt")))
              if not f.endswith("_params.pt")]
-    slide_bags, slide_abund, y = [], [], []
+    slide_bags, slide_abund, y, patient = [], [], [], []
     for f in files:
         sid = os.path.basename(f)[:-3]
         if sid not in labels:
@@ -144,52 +186,77 @@ def main():
         slide_bags.append(d["bags"])
         slide_abund.append(d["abundance"])
         y.append(labels[sid])
+        # TCGA patient = first 3 hyphen fields (TCGA-XX-YYYY); keep a patient's
+        # slides in the SAME fold so same-patient leakage cannot inflate scores
+        patient.append("-".join(sid.split("-")[:3]))
     n = len(y)
-    print(f"{len(files)} cached slides | {n} have a label")
-    if n < 10:
-        print("too few labelled slides to train meaningfully.")
+    print(f"{len(files)} cached slides | {n} have a label "
+          f"| {len(set(patient))} unique patients")
+    if n < 20:
+        print("too few labelled slides for cross-validation.")
         return
 
     y = torch.tensor(y).long()
     abund = torch.stack(slide_abund)
-    print(f"class counts { {c: int((y == i).sum()) for i, c in enumerate(classes)} }\n")
+    counts = {c: int((y == i).sum()) for i, c in enumerate(classes)}
+    print(f"class counts {counts}")
+    # inverse-frequency class weights for the loss
+    freq = torch.tensor([max(counts[c], 1) for c in classes], dtype=torch.float)
+    class_weight = (freq.sum() / (len(classes) * freq))
+    print(f"class weights {[round(w, 2) for w in class_weight.tolist()]}\n")
 
     in_dim = slide_bags[0][args.arms[0]][0][0].shape[1]
-
-    # capacity: match pairwise region-encoder params to the hypergraph one
     target = n_params(HyperRegionEncoder(in_dim, args.hidden))
     pw_h = matched_hidden(lambda i, h, o: PairwiseRegionEncoder(i, h),
                           target, in_dim, 0)
     hidden = {a: (pw_h if a.startswith("pw-") else args.hidden) for a in args.arms}
     print(f"capacity: hyper encoder {target:,} params -> pairwise hidden={pw_h}")
 
-    # split by slide
-    rng = np.random.default_rng(0)
-    perm = rng.permutation(n)
-    n_tr, n_va = int(n * args.split[0]), int(n * args.split[1])
-    tr, va, te = perm[:n_tr], perm[n_tr:n_tr + n_va], perm[n_tr + n_va:]
-    print(f"split: train {len(tr)} / val {len(va)} / test {len(te)}\n")
+    folds = _make_folds(y.numpy(), patient, args.folds, seed=0)
+    print(f"{args.folds}-fold patient-grouped stratified CV; "
+          f"fold test sizes {[len(te) for _, _, te in folds]}\n")
 
-    # abundance-only control
-    print("=== arms (test accuracy, mean +- sd over seeds) ===")
-    ab_scores = [train_eval_mil(AbundanceOnly(abund.shape[1], 32, n_classes),
-                                None, y, tr, va, te, args.epochs, 0.01, s,
-                                abundance=abund, device=args.device) for s in range(args.seeds)]
-    print(f"  {'abundance-only':<18} {np.mean(ab_scores):.3f} +- {np.std(ab_scores):.3f}")
-
-    for arm in args.arms:
-        bags_for_arm = [sb[arm] for sb in slide_bags]
+    # evaluate one arm across all folds x seeds -> flat list of test accuracies
+    def eval_arm(arm):
         scores = []
-        for s in range(args.seeds):
-            set_seed(s)
-            model = MILClassifier(arm, in_dim, hidden[arm], n_classes)
-            scores.append(train_eval_mil(model, bags_for_arm, y, tr, va, te,
-                                         args.epochs, 0.01, s, device=args.device))
-        print(f"  {arm:<18} {np.mean(scores):.3f} +- {np.std(scores):.3f}")
+        bags = None if arm == "abundance-only" else [sb[arm] for sb in slide_bags]
+        for tr, va, te in folds:
+            for s in range(args.seeds):
+                if arm == "abundance-only":
+                    m = AbundanceOnly(abund.shape[1], 32, n_classes)
+                    acc = train_eval_mil(m, None, y, tr, va, te, args.epochs,
+                                         0.01, s, abundance=abund,
+                                         device=args.device, class_weight=class_weight)
+                else:
+                    set_seed(s)
+                    m = MILClassifier(arm, in_dim, hidden[arm], n_classes,
+                                      regions_per_batch=args.regions_per_batch)
+                    acc = train_eval_mil(m, bags, y, tr, va, te, args.epochs,
+                                         0.01, s, device=args.device,
+                                         class_weight=class_weight)
+                scores.append(acc)
+        return np.array(scores)
 
-    print(f"\nmajority-class baseline: "
-          f"{float((y == y.bincount().argmax()).float().mean()):.3f}")
-    print("\nNOTE: slide-level task, small n -- scaffolding for the MIL pipeline.")
+    maj = float((y == y.bincount().argmax()).float().mean())
+    print(f"=== CV test accuracy (mean +- sd over {args.folds} folds x {args.seeds} seeds) ===")
+    print(f"  {'majority baseline':<18} {maj:.3f}")
+    ab = eval_arm("abundance-only")
+    print(f"  {'abundance-only':<18} {ab.mean():.3f} +- {ab.std():.3f}")
+    for arm in args.arms:
+        sc = eval_arm(arm)
+        # how often this arm beats abundance-only, fold-and-seed wise
+        beat = float((sc > ab).mean())
+        flag = "  *beats abundance" if sc.mean() > ab.mean() else ""
+        print(f"  {arm:<18} {sc.mean():.3f} +- {sc.std():.3f}"
+              f"  (>{'abund'} {beat:.0%} of runs){flag}")
+
+    print("\nabundance-only is the bar: an arm shows spatial signal only if it")
+    print("clears it. Majority baseline is the floor. Small n -- read the")
+    print("beat-rate alongside the mean, not the mean alone.")
+
+
+if __name__ == "__main__":
+    main()
     print("Report an arm as beating the control only if it clears abundance-only.")
 
 
