@@ -9,7 +9,7 @@ pruned by the distance cap. Parameter-free apart from that cap; mean degree is
 import numpy as np
 from scipy.spatial import Delaunay
 
-from .common import make_pairwise, symmetrise
+from ..common import make_pairwise, symmetrise
 
 DEFAULTS = dict(radius_um=35.0)
 

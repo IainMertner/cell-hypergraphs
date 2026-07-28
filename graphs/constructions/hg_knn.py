@@ -11,7 +11,7 @@ Fixed cardinality (k+1), which is what hg_radius varies.
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .common import make_hyper, incidences_from_groups
+from ..common import make_hyper, incidences_from_groups
 
 DEFAULTS = dict(k=5, radius_um=35.0)
 

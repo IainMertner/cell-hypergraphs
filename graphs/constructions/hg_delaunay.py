@@ -12,7 +12,7 @@ Order-invariant, parameter-free apart from the distance cap.
 import numpy as np
 from scipy.spatial import Delaunay
 
-from .common import make_hyper, incidences_from_groups
+from ..common import make_hyper, incidences_from_groups
 
 DEFAULTS = dict(radius_um=35.0)
 

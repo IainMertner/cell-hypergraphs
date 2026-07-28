@@ -24,9 +24,9 @@ hg-radius ~8x, hg-knn+semantic ~8x. That spectrum is the argument -- if a
 hypergraph advantage tracks it, the effect is mechanistic rather than incidental.
 """
 
-from . import (cells, common, combine,
-               pw_knn, pw_delaunay, pw_clique,
-               hg_knn, hg_delaunay, hg_radius, hg_semantic)
+from . import cells, common, combine
+from .constructions import (pw_knn, pw_delaunay, pw_clique,
+                            hg_knn, hg_delaunay, hg_radius, hg_semantic)
 from .common import (N_TYPES, N_MORPH, TYPE_MAP, microns_to_px,
                      structural_stats, print_stats_table)
 from .cells import load_cells, load_cache, regions, region_mask, grid_tiles

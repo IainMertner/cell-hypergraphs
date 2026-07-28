@@ -19,7 +19,7 @@ comparator is a star/bipartite expansion instead.
 
 import numpy as np
 
-from .common import make_hyper, incidences_from_groups
+from ..common import make_hyper, incidences_from_groups
 
 DEFAULTS = dict(window_um=100.0, min_size=2)
 

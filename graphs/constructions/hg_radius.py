@@ -14,7 +14,7 @@ while retaining real spread (mean ~10, max ~40).
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .common import make_hyper, incidences_from_groups
+from ..common import make_hyper, incidences_from_groups
 
 def build(centroids, types, radius_px, morph=None, max_size=None):
     n = len(centroids)

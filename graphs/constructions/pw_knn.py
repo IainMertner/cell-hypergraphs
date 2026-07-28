@@ -12,7 +12,7 @@ graphs. pw_delaunay is the order-invariant alternative.
 import numpy as np
 from scipy.spatial import cKDTree
 
-from .common import make_pairwise, symmetrise
+from ..common import make_pairwise, symmetrise
 
 DEFAULTS = dict(k=5, radius_um=35.0)
 

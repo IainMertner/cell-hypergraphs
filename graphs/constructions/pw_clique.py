@@ -19,7 +19,7 @@ theoretical basis for expecting any hypergraph advantage at all.
 import numpy as np
 import torch
 
-from .common import make_pairwise
+from ..common import make_pairwise
 
 
 def build(centroids, types, hyperedge_index, morph=None):
