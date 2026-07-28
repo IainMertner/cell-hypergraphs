@@ -18,7 +18,10 @@
 
 set -euo pipefail
 
-MANIFEST=/home/ucabim3/manifest_100.txt
+# Defaults to whatever next_batch.sh last wrote, so the two compose:
+#     bash next_batch.sh 200 && qsub download_slides.sh
+# Override for a one-off:  qsub -v MANIFEST=/path/to/other.txt download_slides.sh
+MANIFEST="${MANIFEST:-/home/ucabim3/manifest_batch.txt}"
 DEST=/home/ucabim3/Scratch/tcga_brca_slides
 CLIENT=/home/ucabim3/Scratch/gdc-client
 

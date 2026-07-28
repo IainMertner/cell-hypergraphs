@@ -20,6 +20,7 @@ dependencies = [
     "torch-spline-conv",
     # supporting stack
     "numpy",
+    "scipy",                  # cKDTree + Delaunay in every graph construction
     "pandas",                 # MAF parsing, label tables
     "pillow",
     "scikit-image",           # tissue masks, morphology

@@ -5,7 +5,10 @@ Direct higher-order analogue of pw_knn: for each cell, ONE hyperedge containing
 overlap heavily (a cell belongs to its own hyperedge plus every neighbour's that
 reaches it).
 
-Fixed cardinality (k+1), which is what hg_radius varies.
+Cardinality is fixed at k+1 (fewer only where the distance cap bites), which is
+what makes this the clean comparator to pw_knn: same k, same neighbour set, the
+only difference being set-vs-pairs. A variable-cardinality variant lived in
+hg_radius.py and is in git history if that becomes the question.
 """
 
 import numpy as np

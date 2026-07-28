@@ -22,8 +22,10 @@ mkdir -p /home/ucabim3/Scratch/logs
 echo "=== $(date) on $(hostname) ==="
 
 # -u = unbuffered, so per-slide progress appears in the log live rather than
-# only when the job ends. Full STAGE1 arm list (includes hg-knn+semantic) so
-# every arm is cached and available; training chooses which to actually use.
+# only when the job ends. Arms default to pw-knn + hg-knn -- the one comparison
+# the project is trying to answer. To add an arm later, rerun this with
+# `--arms hg-radius`: existing slides are topped up with just the new arm rather
+# than rebuilt, so it costs one arm, not the whole cache.
 python -u precompute_graphs.py \
     --cache-root /home/ucabim3/Scratch/cellvit_out \
     --out /home/ucabim3/Scratch/graph_cache

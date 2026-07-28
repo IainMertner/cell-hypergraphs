@@ -4,11 +4,10 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-# PanNuke taxonomy (CellViT): type indices are 1..5
-TYPE_MAP = {1: "Neoplastic", 2: "Inflammatory", 3: "Connective",
-            4: "Dead", 5: "Epithelial"}
+# PanNuke taxonomy (CellViT): type indices are 1..5, in order
+#   1 Neoplastic  2 Inflammatory  3 Connective  4 Dead  5 Epithelial
+# Index 2 matters most here -- it is the lymphocyte/TIL class the labels concern.
 N_TYPES = 5
-N_MORPH = 5  # area, perimeter, circularity, eccentricity, extent
 
 
 def microns_to_px(um, mpp):
@@ -17,8 +16,20 @@ def microns_to_px(um, mpp):
 
 
 def node_features(types, morph=None):
-    """(N, 5) one-hot type, optionally concatenated with (N, 5) morphology."""
+    """(N, 5) one-hot type, optionally concatenated with (N, 5) morphology.
+
+    types must be in 1..5. This is checked rather than assumed: the one-hot is
+    written at column `type - 1`, so a type-0 cell (CellViT emits 0 for
+    unclassified in some configs) would land at column -1 and be silently
+    encoded as Epithelial. A wrong label that never raises is the worst kind.
+    """
     n = len(types)
+    bad = np.unique(types[(types < 1) | (types > N_TYPES)])
+    if len(bad):
+        raise ValueError(
+            f"cell types must be in 1..{N_TYPES} (PanNuke); found {bad.tolist()}. "
+            "Type 0 is CellViT's unclassified class -- drop those cells upstream "
+            "or map them to a real type before building graphs.")
     x = torch.zeros((n, N_TYPES), dtype=torch.float)
     x[torch.arange(n), torch.from_numpy(types - 1).long()] = 1.0
     if morph is None:

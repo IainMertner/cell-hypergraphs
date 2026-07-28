@@ -6,7 +6,9 @@ k-nearest set), so node degree can slightly exceed k.
 
 Note this construction is NOT invariant to node ordering: ties in the k-nearest
 set are broken by array position, so the same tissue can yield non-isomorphic
-graphs. pw_delaunay is the order-invariant alternative.
+graphs. hg_knn shares that property, so it is not a difference BETWEEN the arms
+-- but it does put a floor on how reproducible either is. An order-invariant
+Delaunay alternative lived in pw_delaunay.py and is in git history.
 """
 
 import numpy as np
