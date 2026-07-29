@@ -5,18 +5,30 @@
 # Instead of one array task per slide (98 separate queue waits), each task
 # processes a BLOCK of slides sequentially. You queue ~5 times instead of ~98.
 #
-# Trade-off: a longer walltime request is harder to schedule than a short one,
-# so don't go too big. 20 slides x ~15 min average ~= 5 hours of compute; the
-# 8 hour walltime below leaves room for a few large slides.
+# Trade-off: a longer walltime request is much harder to SCHEDULE. A GPU job
+# asking 8h needs a big contiguous free window and cannot backfill into the gaps
+# that short jobs slot into -- an 8h/20-slide chunk sat queued ~14h on Myriad and
+# still had only 1 of 15 tasks placed. 8 slides x ~15 min ~= 2h of compute, so
+# the 3h walltime below leaves room for a few large slides while staying easy to
+# place. Prefer MORE, SHORTER tasks: they start independently, so you see partial
+# progress instead of all-or-nothing.
 #
 # Safe to resubmit: the skip-if-done check means completed slides cost seconds.
+# Better still, point SLIDE_LIST at only the unsegmented slides, so no task
+# spends a queue wait just to print "already done":
 #
-# SUBMIT (99 slides / 20 per chunk = 5 tasks):
-#     qsub -t 1-5 cellvit_chunked.sh
+#     find ~/Scratch/tcga_brca_slides -name '*.svs' | sort | while read w; do
+#       id=$(basename "$w" .svs | cut -d. -f1)
+#       [ -f ~/Scratch/cellvit_out/$id/cells_cache.npz ] || echo "$w"
+#     done > ~/Scratch/slide_list.txt
+#
+# SUBMIT -- N = ceil(lines in slide_list.txt / CHUNK_SIZE):
+#     wc -l ~/Scratch/slide_list.txt        # e.g. 160
+#     qsub -t 1-20 cellvit_chunked.sh       # 160 / 8 = 20 tasks
 # =============================================================================
 
 #$ -N cellvit_chunk
-#$ -l h_rt=8:0:0
+#$ -l h_rt=3:0:0
 #$ -l mem=8G
 #$ -l gpu=1
 #$ -pe smp 4
@@ -28,7 +40,7 @@ set -uo pipefail          # NOT -e: one bad slide must not kill the whole chunk
 
 SLIDE_LIST=/home/ucabim3/Scratch/slide_list.txt
 OUTROOT=/home/ucabim3/Scratch/cellvit_out
-CHUNK_SIZE=20
+CHUNK_SIZE=8            # keep in step with h_rt above: 8 x ~15min ~= 2h of 3h
 
 # Everything comes from the repo, not from copies in $HOME. SGE runs a SPOOLED
 # copy of this file (/var/opt/sge/.../job_scripts/<jobid>), so $0 cannot be used
