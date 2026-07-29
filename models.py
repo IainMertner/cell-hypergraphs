@@ -190,6 +190,23 @@ def pack_hyper(region_graphs):
             torch.cat(batch), len(region_graphs), edge_off)
 
 
+def pack_bag(region_graphs, is_pw, regions_per_batch=16):
+    """Pack one slide's regions into memory-bounded groups, ONCE.
+
+    Call this per slide before training and reuse the result for every epoch and
+    every run. Packing is a deterministic function of the region graphs, so doing
+    it inside forward() re-runs the same torch.cat over many small tensors on
+    every train, val and test pass -- tens of thousands of times across a sweep,
+    for an identical answer.
+
+    Region boundaries are never split, so grouping does not change any region
+    vector; this is purely about not repeating work.
+    """
+    packer = pack_pairwise if is_pw else pack_hyper
+    return [packer(region_graphs[i:i + regions_per_batch])
+            for i in range(0, len(region_graphs), regions_per_batch)]
+
+
 # ------------------------------------------------------------ MIL aggregation
 
 class AttentionMIL(nn.Module):
@@ -239,22 +256,28 @@ class MILClassifier(nn.Module):
             self.pool = AttentionMIL(self.encoder.out_dim)
         self.head = nn.Linear(self.encoder.out_dim, n_classes)
 
-    def _encode_regions(self, bag_graphs):
-        """Encode all regions to (R, 2*hidden), in memory-bounded groups."""
+    def _encode_regions(self, packed):
+        """Encode pre-packed groups to (R, REGION_DIM)."""
         vecs = []
-        for i in range(0, len(bag_graphs), self.rpb):
-            group = bag_graphs[i:i + self.rpb]
+        for g in packed:
             if self.is_pw:
-                x, ei, batch, R = pack_pairwise(group)
+                x, ei, batch, R = g
                 vecs.append(self.encoder(x, ei, batch, R))
             else:
-                x, hi, batch, R, n_he = pack_hyper(group)
+                x, hi, batch, R, n_he = g
                 vecs.append(self.encoder(x, hi, batch, R, n_he))
         return torch.cat(vecs, dim=0)          # attached: gradients flow through all groups
 
-    def forward(self, bag_graphs):
-        """bag_graphs: list of (x, struct) region tuples for one slide."""
-        region_vecs = self._encode_regions(bag_graphs)
+    def forward(self, bag):
+        """bag: either raw [(x, struct), ...] regions, or pre-packed groups from
+        pack_bag(). Prefer pre-packed -- packing is a deterministic function of
+        the region graphs, so doing it here repeats identical torch.cat work on
+        every epoch for train, val AND test. Hoisting it out of the loop is a
+        pure speedup with no effect on the result.
+        """
+        packed = (pack_bag(bag, self.is_pw, self.rpb)
+                  if bag and len(bag[0]) == 2 else bag)
+        region_vecs = self._encode_regions(packed)
         if self.pool_kind == "attention":
             slide_vec, att = self.pool(region_vecs)
         else:

@@ -28,10 +28,9 @@
 # =============================================================================
 
 #$ -N cellvit_chunk
-#$ -l h_rt=3:0:0
-#$ -l mem=8G
+#$ -l h_rt=2:0:0
+#$ -l mem=32G
 #$ -l gpu=1
-#$ -pe smp 4
 #$ -wd /home/ucabim3/Scratch
 #$ -o /home/ucabim3/Scratch/logs/chunk.$TASK_ID.out
 #$ -e /home/ucabim3/Scratch/logs/chunk.$TASK_ID.err
@@ -40,7 +39,10 @@ set -uo pipefail          # NOT -e: one bad slide must not kill the whole chunk
 
 SLIDE_LIST=/home/ucabim3/Scratch/slide_list.txt
 OUTROOT=/home/ucabim3/Scratch/cellvit_out
-CHUNK_SIZE=8            # keep in step with h_rt above: 8 x ~15min ~= 2h of 3h
+CHUNK_SIZE=4            # 4 x ~15min ~= 1h against a 2h wall, so a slow slide
+                        # cannot blow the chunk. Short tasks also place far more
+                        # easily, and the skip-if-done check makes an overrun
+                        # cheap: resubmit and only the unfinished slides rerun.
 
 # Everything comes from the repo, not from copies in $HOME. SGE runs a SPOOLED
 # copy of this file (/var/opt/sge/.../job_scripts/<jobid>), so $0 cannot be used

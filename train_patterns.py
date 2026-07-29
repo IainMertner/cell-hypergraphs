@@ -29,6 +29,7 @@ import argparse
 import glob
 import hashlib
 import os
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -37,7 +38,7 @@ from scipy import stats
 
 from graphs import N_TYPES, DEFAULT_ARMS
 from models import (set_seed, matched_hidden, n_params, macro_f1,
-                    MILClassifier, AbundanceOnly)
+                    MILClassifier, AbundanceOnly, pack_bag)
 
 # 4-way and the collapsed spatial-only ("arrangement") mapping
 CLASSES4 = ["Brisk Diffuse", "Brisk Band-like", "Non-Brisk Focal", "Non-Brisk Multifocal"]
@@ -199,7 +200,12 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     def run(i):
         if abundance is not None:
             return model(abundance[i])
-        bag = [(x.to(device), s.to(device)) for x, s in bags[i]]
+        # bags[i] is already PACKED (see pack_bag in main) -- move the packed
+        # tensors to the device rather than re-packing per call. On CPU .to() is
+        # a no-op; on GPU this transfers a few large tensors instead of many
+        # small ones.
+        bag = [tuple(t.to(device) if torch.is_tensor(t) else t for t in g)
+               for g in bags[i]]
         return model(bag)[0]
 
     y_np = labels_t.detach().cpu().numpy()
@@ -207,7 +213,13 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     def preds(idx):
         return np.array([int(run(i).argmax()) for i in idx])
 
-    best_val, best, since = -1.0, (0.0, 0.0), 0
+    # Snapshot the best-val WEIGHTS and score the test fold once at the end,
+    # rather than re-scoring test on every epoch that improves val. Identical
+    # result -- test is still measured at exactly the best-val point -- but it
+    # drops ~20% of the forward passes, since early epochs improve constantly.
+    # Safe because these models have no running buffers (no BatchNorm), so
+    # state_dict fully captures them.
+    best_val, best_state, since = -1.0, None, 0
     for _ in range(epochs):
         model.train()
         opt.zero_grad()
@@ -220,19 +232,24 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         with torch.no_grad():
             va_acc = float((preds(va) == y_np[va]).mean())
             if va_acc > best_val:
-                # Report macro-F1 as well as accuracy. With imbalanced labels a
-                # majority predictor scores respectable accuracy but near-floor
-                # macro-F1, so the pair makes collapse visible; accuracy alone
-                # cannot distinguish a real model from one that learned nothing.
-                tp = preds(te)
                 best_val, since = va_acc, 0
-                best = (float((tp == y_np[te]).mean()),
-                        macro_f1(tp, y_np[te], n_classes))
+                best_state = {k: v.detach().clone()
+                              for k, v in model.state_dict().items()}
             else:
                 since += 1
                 if since >= patience:
                     break
-    return best
+
+    if best_state is None:                      # never improved on -1.0
+        return 0.0, 0.0
+    model.load_state_dict(best_state)
+    model.eval()
+    with torch.no_grad():
+        # macro-F1 alongside accuracy: with imbalanced labels a majority
+        # predictor scores respectable accuracy but near-floor macro-F1, so the
+        # pair makes collapse visible where accuracy alone cannot.
+        tp = preds(te)
+        return float((tp == y_np[te]).mean()), macro_f1(tp, y_np[te], n_classes)
 
 
 def corrected_t_test(diffs, n_test, n_train):
@@ -460,8 +477,24 @@ def main():
     # arms and the beat-rate below is a genuine paired comparison.
     def eval_arm(arm):
         scores = []
-        bags = None if arm == "abundance-only" else [sb[arm] for sb in slide_bags]
-        for s, tr, va, te in runs:
+        # Pack every slide ONCE for this arm, then reuse across all runs and all
+        # epochs. Previously forward() re-packed on every pass -- 15 runs x ~40
+        # epochs x ~113 slides of identical torch.cat work.
+        if arm == "abundance-only":
+            bags = None
+        else:
+            t_pack = time.time()
+            bags = [pack_bag(sb[arm], arm.startswith("pw-"),
+                             args.regions_per_batch) for sb in slide_bags]
+            print(f"  [{arm}] packed {len(bags)} slides in "
+                  f"{time.time() - t_pack:.1f}s (once, reused by every run)",
+                  flush=True)
+        # Per-run progress, flushed. Without this an arm is silent for its whole
+        # 15-50 runs, so a walltime kill loses every result AND you cannot tell a
+        # slow job from a hung one. The rate also lets you size the next run.
+        t_arm = time.time()
+        print(f"  [{arm}] {len(runs)} runs ...", flush=True)
+        for j, (s, tr, va, te) in enumerate(runs, 1):
             # seed BEFORE constructing the model, for every arm including the
             # control -- otherwise the control's init depends on whatever RNG
             # state the previous arm happened to leave behind.
@@ -478,6 +511,11 @@ def main():
                                    0.01, s, device=args.device,
                                    class_weight=class_weight)
             scores.append(r)
+            el = time.time() - t_arm
+            print(f"    [{arm}] run {j}/{len(runs)} (seed {s}) "
+                  f"acc={r[0]:.3f} f1={r[1]:.3f} | "
+                  f"{el / j:.0f}s/run | eta {(len(runs) - j) * el / j / 60:.0f}min",
+                  flush=True)
         a = np.array(scores)                      # (n_runs, 2) = acc, macro-F1
         return a[:, 0], a[:, 1]
 
