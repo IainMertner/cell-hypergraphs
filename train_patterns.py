@@ -51,8 +51,18 @@ CLASSES4 = ["Brisk Diffuse", "Brisk Band-like", "Non-Brisk Focal", "Non-Brisk Mu
 # version of this mapping did exactly that, which made --task arrangement the
 # worst available test of spatial structure rather than the best.
 #
-# Isolating arrangement means CROSSING briskness, so each target class holds one
-# Brisk and one Non-Brisk label and abundance carries no information about it.
+# Crossing briskness -- each target class holding one Brisk and one Non-Brisk
+# label -- removes that PERFECT collinearity. It does NOT make the target
+# independent of abundance. How much briskness still predicts arrangement
+# depends on the cohort's joint distribution, and can be large: on 113 TCGA-BRCA
+# slides a briskness-only rule scores 0.717 against a 0.558 majority baseline,
+# because Brisk skews Diffuse and Non-Brisk skews Focal. load_labels() prints
+# that number every run -- read it before calling this a spatial task.
+#
+# The genuinely abundance-free test is a WITHIN-briskness contrast (Non-Brisk
+# Focal vs Non-Brisk Multifocal, say), which holds briskness constant by
+# construction at the cost of sample size.
+#
 # The axis below is "one contiguous locus" vs "several / dispersed":
 #     Band-like  -- a single band at the invasive margin  -> focused
 #     Focal      -- a single focus                        -> focused
@@ -66,28 +76,80 @@ ARRANGEMENT = {"Brisk Band-like": "focused", "Non-Brisk Focal": "focused",
                "Brisk Diffuse": "dispersed", "Non-Brisk Multifocal": "dispersed"}
 
 
-def load_labels(csv_path, task):
+def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
+    """CSV -> ({slide id: class index}, ordered class names).
+
+    task="auto" takes `label_col` at face value: the classes are its sorted
+    unique values. Because the graph cache is LABEL-FREE -- precompute_graphs.py
+    never sees a label -- pointing stage 2 at a different CSV is the whole cost
+    of running another slide-level categorical task. No re-precompute.
+
+    That covers discrete targets (subtype, grade, stage, receptor status).
+    Continuous targets need a regression path instead: the loss, class weights,
+    stratified folds and accuracy/macro-F1 all assume discrete classes.
+
+    pattern4/arrangement are the TIL-specific mappings and always read
+    PatternLabels, ignoring label_col.
+    """
     df = pd.read_csv(csv_path)
-    df = df[["SlideID", "PatternLabels"]].dropna()
-    if task == "arrangement":
+    if "SlideID" not in df.columns:
+        raise ValueError(f"{csv_path} has no SlideID column "
+                         f"(found: {list(df.columns)})")
+
+    if task == "auto":
+        if label_col not in df.columns:
+            raise ValueError(f"{csv_path} has no {label_col!r} column "
+                             f"(found: {list(df.columns)}); set --label-col")
+        df = df[["SlideID", label_col]].dropna()
+        df["y"] = df[label_col].astype(str)        # str so numeric codes name cleanly
+        # Drop classes too small to survive fold splitting. With ~140 slides a
+        # class of 2 cannot appear in train, val AND test, so it contributes
+        # nothing but a depressed macro-F1. Dropping is loud, not silent --
+        # it changes the task, and you should know it happened.
+        counts = df.y.value_counts()
+        rare = sorted(counts[counts < min_class].index)
+        if rare:
+            print(f"dropping {len(rare)} class(es) with < {min_class} slides: "
+                  + ", ".join(f"{c} (n={counts[c]})" for c in rare))
+            df = df[~df.y.isin(rare)]
+        classes = sorted(df.y.unique())
+        if len(classes) < 2:
+            raise ValueError(
+                f"{label_col!r} leaves {len(classes)} class(es) after the "
+                f"min-class={min_class} filter; nothing to classify")
+        print(f"label column {label_col!r} -> {len(classes)} classes\n")
+    elif task == "arrangement":
+        df = df[["SlideID", "PatternLabels"]].dropna()
         df = df[df.PatternLabels.isin(ARRANGEMENT)]
         df["y"] = df.PatternLabels.map(ARRANGEMENT)
         classes = ["focused", "dispersed"]
-        # Show the briskness balance. If either row is all-Brisk or all-Non-Brisk
-        # the target has collapsed back onto abundance and no spatial claim can
-        # survive -- this is the check that would have caught the old mapping.
+        # Quantify how much of this "spatial" target abundance alone explains.
+        # A mixed cross-tab is necessary but NOT sufficient: the best
+        # briskness-only rule is what actually says how confounded the task is,
+        # and it can sit far above the majority baseline even when both rows are
+        # mixed. Anything the graph arms achieve below this line is not spatial.
         brisk = df.PatternLabels.str.startswith("Brisk")
-        print("briskness x arrangement (must be mixed on BOTH rows):")
+        print("briskness x arrangement:")
         for c in classes:
             m = df.y == c
             print(f"  {c:<10} Brisk {int((m & brisk).sum()):>3} | "
                   f"Non-Brisk {int((m & ~brisk).sum()):>3}")
-        if any((df.y == c).sum() and ((df.y == c) & brisk).nunique() == 1
-               for c in classes):
-            print("  WARNING: a class is pure in briskness -- this is an "
-                  "abundance task, not an arrangement one.")
+        n_tot = len(df)
+        if n_tot:
+            # best rule using briskness alone: per stratum, predict its majority
+            best = sum(max(int(((df.y == c) & b).sum()) for c in classes)
+                       for b in (brisk, ~brisk))
+            maj = max(int((df.y == c).sum()) for c in classes)
+            print(f"  majority baseline    {maj / n_tot:.3f}")
+            print(f"  briskness-only rule  {best / n_tot:.3f}   "
+                  "<- abundance alone gets this far")
+            if best / n_tot - maj / n_tot > 0.05:
+                print("  WARNING: briskness explains much of this target. It is "
+                      "only partly a spatial task;\n           an arm must clear "
+                      "the briskness-only rule, not just the majority baseline.")
         print()
     else:
+        df = df[["SlideID", "PatternLabels"]].dropna()
         df = df[df.PatternLabels.isin(CLASSES4)]
         df["y"] = df.PatternLabels
         classes = CLASSES4
@@ -245,7 +307,14 @@ def main():
     ap.add_argument("--graph-cache", default="graph_cache",
                     help="dir of precomputed per-slide graphs (precompute_graphs.py)")
     ap.add_argument("--labels", required=True)
-    ap.add_argument("--task", choices=["pattern4", "arrangement"], default="pattern4")
+    ap.add_argument("--task", choices=["pattern4", "arrangement", "auto"],
+                    default="pattern4",
+                    help="pattern4/arrangement are the TIL mappings; auto reads "
+                         "--label-col as-is for any categorical slide-level task")
+    ap.add_argument("--label-col", default="PatternLabels",
+                    help="CSV column holding the label (--task auto only)")
+    ap.add_argument("--min-class", type=int, default=5,
+                    help="--task auto: drop classes with fewer slides than this")
     ap.add_argument("--arms", nargs="*", default=DEFAULT_ARMS,
                     help="default is the single pw-knn vs hg-knn comparison; "
                          "abundance-only always runs as the control")
@@ -259,7 +328,8 @@ def main():
                     help="regions encoded per GPU pass; lower if OOM on big slides")
     args = ap.parse_args()
 
-    labels, classes = load_labels(args.labels, args.task)
+    labels, classes = load_labels(args.labels, args.task,
+                                  args.label_col, args.min_class)
     n_classes = len(classes)
     print(f"task={args.task} | {n_classes} classes: {classes}")
 
@@ -315,6 +385,14 @@ def main():
     fingerprint = hashlib.sha1("\n".join(sorted(slide_ids)).encode()).hexdigest()[:10]
     print(f"cohort {fingerprint} | {len(files)} cached slides | {n} have a label "
           f"| {len(set(patient))} unique patients")
+    # Patient grouping parses TCGA-XX-YYYY out of the slide id. On any other
+    # naming scheme that parse is meaningless and every slide becomes its own
+    # "patient" -- which silently removes the leakage protection rather than
+    # failing, so say so loudly.
+    if not all(s.startswith("TCGA-") for s in slide_ids):
+        print("  WARNING: some slide ids are not TCGA-formatted. Patient "
+              "grouping parses TCGA-XX-YYYY and will not group them, so "
+              "same-patient slides could span train/test.")
     if n < 20:
         print("too few labelled slides for cross-validation.")
         return

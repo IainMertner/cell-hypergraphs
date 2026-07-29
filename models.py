@@ -144,16 +144,24 @@ class HyperRegionEncoder(nn.Module):
 
 
 # ------------------------------------------------------------ packing a slide
+#
+# DEVICE: every tensor created here must be built on the same device as the
+# incoming features. The `batch` vector and the empty-hyperedge fallback are
+# constructed from scratch rather than derived from x, so they default to CPU
+# unless told otherwise -- and a CPU index against CUDA features fails inside
+# scatter, not here, which makes it read like a PyG bug. CPU-only runs never
+# expose it because everything agrees by accident.
 
 def pack_pairwise(region_graphs):
     """Combine a slide's pairwise regions into one disconnected graph.
     region_graphs: list of (x, edge_index). Returns x, edge_index, batch, R."""
     xs, eis, batch = [], [], []
     node_off = 0
+    dev = region_graphs[0][0].device
     for r, (x, ei) in enumerate(region_graphs):
         xs.append(x)
         eis.append(ei + node_off)
-        batch.append(torch.full((x.size(0),), r, dtype=torch.long))
+        batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=dev))
         node_off += x.size(0)
     return (torch.cat(xs, 0), torch.cat(eis, 1),
             torch.cat(batch), len(region_graphs))
@@ -165,6 +173,7 @@ def pack_hyper(region_graphs):
     regions. Returns x, hyperedge_index, batch, R, total_hyperedges."""
     xs, his, batch = [], [], []
     node_off, edge_off = 0, 0
+    dev = region_graphs[0][0].device
     for r, (x, hi) in enumerate(region_graphs):
         xs.append(x)
         if hi.numel():
@@ -173,10 +182,10 @@ def pack_hyper(region_graphs):
             h[1] += edge_off
             his.append(h)
             edge_off += int(hi[1].max()) + 1
-        batch.append(torch.full((x.size(0),), r, dtype=torch.long))
+        batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=dev))
         node_off += x.size(0)
     hyperedge_index = (torch.cat(his, 1) if his
-                       else torch.empty((2, 0), dtype=torch.long))
+                       else torch.empty((2, 0), dtype=torch.long, device=dev))
     return (torch.cat(xs, 0), hyperedge_index,
             torch.cat(batch), len(region_graphs), edge_off)
 
