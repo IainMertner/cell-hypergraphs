@@ -16,7 +16,12 @@
 #$ -o /home/ucabim3/Scratch/logs/patterns.out
 #$ -e /home/ucabim3/Scratch/logs/patterns.err
 
-source /home/ucabim3/cellvit_env.sh
+# Source from the repo, not a copy in $HOME, and abort if it is not there.
+ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/segmentation/cellvit_env.sh
+[ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
+source "$ENV_SH"
+python -c "import torch" 2>/dev/null || {
+    echo "FATAL: torch not importable after sourcing $ENV_SH" >&2; exit 1; }
 mkdir -p /home/ucabim3/Scratch/logs
 echo "=== $(date) on $(hostname) ==="
 nvidia-smi --query-gpu=name --format=csv,noheader

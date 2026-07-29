@@ -30,7 +30,24 @@ SLIDE_LIST=/home/ucabim3/Scratch/slide_list.txt
 OUTROOT=/home/ucabim3/Scratch/cellvit_out
 CHUNK_SIZE=20
 
-source /home/ucabim3/cellvit_env.sh
+# Everything comes from the repo, not from copies in $HOME. SGE runs a SPOOLED
+# copy of this file (/var/opt/sge/.../job_scripts/<jobid>), so $0 cannot be used
+# to locate siblings -- the path has to be absolute.
+REPO=/home/ucabim3/Scratch/cell-hypergraphs
+ENV_SH="$REPO/segmentation/cellvit_env.sh"
+CACHE_PY="$REPO/segmentation/cache_cells.py"
+
+# FAIL FAST. Without these checks a missing env is not fatal: the script carries
+# on, prints "cellvit-inference: command not found" once per slide, exits 0, and
+# throws away a multi-hour GPU allocation having segmented nothing. Jobs 36789
+# and 38663 both did exactly that after ~14h queue waits.
+[ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
+source "$ENV_SH"
+command -v cellvit-inference >/dev/null 2>&1 || {
+    echo "FATAL: cellvit-inference not on PATH after sourcing $ENV_SH" >&2
+    echo "       (conda env missing or broken?)" >&2; exit 1; }
+[ -f "$CACHE_PY" ] || { echo "FATAL: missing $CACHE_PY" >&2; exit 1; }
+[ -s "$SLIDE_LIST" ] || { echo "FATAL: $SLIDE_LIST missing or empty" >&2; exit 1; }
 
 TOTAL=$(wc -l < "$SLIDE_LIST")
 START=$(( (SGE_TASK_ID - 1) * CHUNK_SIZE + 1 ))
@@ -71,7 +88,7 @@ for i in $(seq "$START" "$END"); do
             process_wsi \
             --wsi_path "$WSI"
     then
-        python /home/ucabim3/cache_cells.py "$OUTDIR" \
+        python "$CACHE_PY" "$OUTDIR" \
             && DONE=$((DONE + 1)) \
             || { echo "[$i] WARN: caching failed"; FAILED=$((FAILED + 1)); }
     else
