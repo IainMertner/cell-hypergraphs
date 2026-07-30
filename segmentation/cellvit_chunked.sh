@@ -1,17 +1,20 @@
 #!/bin/bash -l
 # =============================================================================
-# CellViT++ inference, CHUNKED.
+# CellViT++ inference. ONE SLIDE PER ARRAY TASK.
 #
-# Instead of one array task per slide (98 separate queue waits), each task
-# processes a BLOCK of slides sequentially. You queue ~5 times instead of ~98.
+# This used to batch slides into chunks, on the theory that fewer, larger tasks
+# meant fewer queue waits. That was wrong: SGE schedules array tasks
+# INDEPENDENTLY, so 160 tasks queue once, not 160 times -- while the longer
+# walltime a chunk needs makes every one of them harder to place. An 8h/20-slide
+# chunk sat queued ~14h with 1 of 15 tasks placed; a 3h GPU job for the same
+# work fared little better. Short jobs backfill into gaps long ones cannot reach.
 #
-# Trade-off: a longer walltime request is much harder to SCHEDULE. A GPU job
-# asking 8h needs a big contiguous free window and cannot backfill into the gaps
-# that short jobs slot into -- an 8h/20-slide chunk sat queued ~14h on Myriad and
-# still had only 1 of 15 tasks placed. 8 slides x ~15 min ~= 2h of compute, so
-# the 3h walltime below leaves room for a few large slides while staying easy to
-# place. Prefer MORE, SHORTER tasks: they start independently, so you see partial
-# progress instead of all-or-nothing.
+# One slide (~15 min) against a 1.5h wall is a small, easy-to-place request:
+#   - tasks start as GPUs free, so you see steady progress, not all-or-nothing
+#   - a failure or overrun costs ONE slide, not a whole chunk
+#   - no walltime is wasted by a chunk that finishes early
+#
+# Set CHUNK_SIZE above 1 to restore batching, but raise h_rt with it.
 #
 # Safe to resubmit: the skip-if-done check means completed slides cost seconds.
 # Better still, point SLIDE_LIST at only the unsegmented slides, so no task
@@ -22,13 +25,16 @@
 #       [ -f ~/Scratch/cellvit_out/$id/cells_cache.npz ] || echo "$w"
 #     done > ~/Scratch/slide_list.txt
 #
-# SUBMIT -- N = ceil(lines in slide_list.txt / CHUNK_SIZE):
-#     wc -l ~/Scratch/slide_list.txt        # e.g. 160
-#     qsub -t 1-20 cellvit_chunked.sh       # 160 / 8 = 20 tasks
+# SUBMIT -- one task per slide:
+#     N=$(wc -l < ~/Scratch/slide_list.txt)
+#     qsub -t 1-$N segmentation/cellvit_chunked.sh
+#
+# Add -tc to cap how many run at once if you want to leave GPUs for other jobs:
+#     qsub -t 1-$N -tc 8 segmentation/cellvit_chunked.sh
 # =============================================================================
 
-#$ -N cellvit_chunk
-#$ -l h_rt=2:0:0
+#$ -N cellvit
+#$ -l h_rt=1:30:0
 #$ -l mem=32G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch
@@ -39,10 +45,9 @@ set -uo pipefail          # NOT -e: one bad slide must not kill the whole chunk
 
 SLIDE_LIST=/home/ucabim3/Scratch/slide_list.txt
 OUTROOT=/home/ucabim3/Scratch/cellvit_out
-CHUNK_SIZE=4            # 4 x ~15min ~= 1h against a 2h wall, so a slow slide
-                        # cannot blow the chunk. Short tasks also place far more
-                        # easily, and the skip-if-done check makes an overrun
-                        # cheap: resubmit and only the unfinished slides rerun.
+# One slide per task. h_rt=1:30:0 gives ~6x the ~15min average, enough for the
+# largest slides. If you raise this, raise h_rt to match or tasks die mid-slide.
+CHUNK_SIZE="${CHUNK_SIZE:-1}"
 
 # Everything comes from the repo, not from copies in $HOME. SGE runs a SPOOLED
 # copy of this file (/var/opt/sge/.../job_scripts/<jobid>), so $0 cannot be used
