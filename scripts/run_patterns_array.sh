@@ -1,0 +1,71 @@
+#!/bin/bash -l
+# =============================================================================
+# STAGE 2, SPLIT ACROSS ARRAY TASKS. One seed per task.
+#
+# This is run_patterns.sh's work divided by seed. It sacrifices nothing:
+# _make_folds is a deterministic function of (cohort, folds, seed) and the
+# cohort comes from sorted(glob(...)), so seed 1 computed here is bit-identical
+# to seed 1 computed inline. Arms stay paired run-for-run.
+#
+# WHY BOTHER
+#   placement   a ~4h task places far more easily than a 12h one, and array
+#               tasks are scheduled independently so they trickle in rather
+#               than waiting for one big window.
+#   resilience  a walltime kill or a node failure costs ONE seed, not the whole
+#               sweep. Previously a 12h job that died at 11h produced nothing.
+#   visibility  partial results land as tasks finish, instead of one blind wait.
+#
+# SUBMIT -- N tasks = N seeds (task 1 -> seed 0, task 2 -> seed 1, ...):
+#     qsub -t 1-3 scripts/run_patterns_array.sh
+#
+# THEN merge. combine_results.py refuses to merge parts whose cohort
+# fingerprints differ, so a segmentation job landing mid-sweep cannot silently
+# splice two experiments together:
+#     python combine_results.py ~/Scratch/results/
+#
+# NOTE: SGE spools a COPY of this script at submit time, so editing it does not
+# affect an already-queued job. Change something? qdel and resubmit.
+# =============================================================================
+
+#$ -N pat_seed
+#$ -l h_rt=12:0:0
+#$ -l mem=48G
+#$ -l gpu=1
+#$ -wd /home/ucabim3/Scratch/cell-hypergraphs
+#$ -o /home/ucabim3/Scratch/logs/pat_seed.$TASK_ID.out
+#$ -e /home/ucabim3/Scratch/logs/pat_seed.$TASK_ID.err
+
+ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/segmentation/cellvit_env.sh
+[ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
+source "$ENV_SH"
+python -c "import torch" 2>/dev/null || {
+    echo "FATAL: torch not importable after sourcing $ENV_SH" >&2; exit 1; }
+
+RESULTS=/home/ucabim3/Scratch/results
+mkdir -p /home/ucabim3/Scratch/logs "$RESULTS"
+
+# SGE array tasks are 1-based; seeds are 0-based.
+SEED=$(( SGE_TASK_ID - 1 ))
+
+EPOCHS="${EPOCHS:-150}"
+FOLDS="${FOLDS:-5}"
+TASK="${TASK:-pattern4}"
+RPB="${RPB:-16}"
+
+echo "=== $(date) on $(hostname) ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
+    || echo "WARNING: no GPU visible -- this will not finish in the walltime"
+echo "array task $SGE_TASK_ID -> SEED $SEED | task=$TASK folds=$FOLDS epochs=$EPOCHS"
+
+python -u train_patterns.py \
+    --graph-cache /home/ucabim3/Scratch/graph_cache \
+    --labels /home/ucabim3/Scratch/til_indices.csv \
+    --task "$TASK" \
+    --regions-per-batch "$RPB" \
+    --epochs "$EPOCHS" \
+    --folds "$FOLDS" \
+    --seed "$SEED" \
+    --save-results "$RESULTS/${TASK}_seed${SEED}.json"
+
+echo "=== done: $(date) ==="
+echo "when all tasks finish:  python combine_results.py $RESULTS"

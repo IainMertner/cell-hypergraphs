@@ -28,6 +28,7 @@ Usage:
 import argparse
 import glob
 import hashlib
+import json
 import os
 import time
 import numpy as np
@@ -339,6 +340,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--seeds", type=int, default=5,
                     help="each seed = a fresh patient->fold assignment AND init")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="run ONLY this seed (0-based). For splitting a sweep "
+                         "across array tasks; merge with combine_results.py")
+    ap.add_argument("--save-results", default=None,
+                    help="write per-run scores + cohort fingerprint to this "
+                         "JSON path, for combine_results.py")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     ap.add_argument("--regions-per-batch", type=int, default=16,
@@ -464,13 +471,24 @@ def main():
     # the dominant source of variance at this n is WHICH patients land in test,
     # not the init. This is repeated k-fold CV: seed s gives its own patient->fold
     # assignment, identical across arms, so arm-vs-arm stays paired.
-    fold_sets = [_make_folds(y.numpy(), patient, args.folds, seed=s)
-                 for s in range(args.seeds)]
-    runs = [(s, tr, va, te) for s in range(args.seeds)
-            for tr, va, te in fold_sets[s]]
+    #
+    # --seed runs ONE seed only, so a sweep can be split across array tasks.
+    # Splitting sacrifices nothing: _make_folds is a deterministic function of
+    # (cohort, k, seed), and the cohort comes from sorted(glob(...)), so seed 1
+    # computed in a separate job is bit-identical to seed 1 computed inline.
+    # Arms stay paired run-for-run, which is what the corrected test needs.
+    # combine_results.py merges the parts (and refuses to merge across cohorts).
+    seed_list = [args.seed] if args.seed is not None else list(range(args.seeds))
+    fold_sets = {s: _make_folds(y.numpy(), patient, args.folds, seed=s)
+                 for s in seed_list}
+    runs = [(s, tr, va, te) for s in seed_list for tr, va, te in fold_sets[s]]
+    if args.seed is not None:
+        print(f"SEED {args.seed} ONLY -- this is one part of a split sweep; "
+              f"merge with combine_results.py")
     print(f"{args.folds}-fold patient-grouped stratified CV, resampled per seed; "
-          f"{len(runs)} runs/arm")
-    print(f"fold test sizes (seed 0) {[len(te) for _, _, te in fold_sets[0]]}\n")
+          f"seeds {seed_list} -> {len(runs)} runs/arm")
+    print(f"fold test sizes (seed {seed_list[0]}) "
+          f"{[len(te) for _, _, te in fold_sets[seed_list[0]]]}\n")
 
     # evaluate one arm across all seed x fold runs -> flat list of test accuracies.
     # `runs` is a fixed ordered list, so scores line up index-for-index between
@@ -523,7 +541,7 @@ def main():
     n_te = float(np.mean([len(te) for _, _, _, te in runs]))
     n_tr = float(np.mean([len(tr) for _, tr, _, _ in runs]))
 
-    print(f"=== test scores over {args.seeds} seeds x {args.folds} folds "
+    print(f"=== test scores over seeds {seed_list} x {args.folds} folds "
           f"({len(runs)} runs/arm) ===")
     print(f"  {'majority baseline':<18} acc {maj:.3f}")
     ab, ab_f1 = eval_arm("abundance-only")
@@ -531,8 +549,10 @@ def main():
           f" | macroF1 {ab_f1.mean():.3f}")
     print(f"  {'':<18} {'':<4}(the bar every arm below must clear)\n")
 
+    per_arm = {"abundance-only": {"acc": ab.tolist(), "f1": ab_f1.tolist()}}
     for arm in args.arms:
         sc, f1 = eval_arm(arm)
+        per_arm[arm] = {"acc": sc.tolist(), "f1": f1.tolist()}
         beat = float((sc > ab).mean())
         mean_d, _t, p = corrected_t_test(sc - ab, n_te, n_tr)
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
@@ -540,6 +560,36 @@ def main():
               f" | macroF1 {f1.mean():.3f}")
         print(f"  {'':<18} vs abundance {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
+
+    if args.save_results:
+        # Everything combine_results.py needs to merge parts SAFELY. The cohort
+        # fingerprint is the guard: if segmentation lands between array tasks the
+        # slide set changes, folds change, and merging would silently splice two
+        # different experiments together.
+        os.makedirs(os.path.dirname(os.path.abspath(args.save_results)) or ".",
+                    exist_ok=True)
+        with open(args.save_results, "w") as fh:
+            json.dump({
+                "cohort": fingerprint,
+                "n_slides": n,
+                "n_patients": len(set(patient)),
+                "task": args.task,
+                "classes": classes,
+                "class_counts": counts,
+                "majority_baseline": maj,
+                "seeds": seed_list,
+                "folds": args.folds,
+                "epochs": args.epochs,
+                "arms": list(args.arms),
+                "n_test_mean": n_te,
+                "n_train_mean": n_tr,
+                # run order is (seed, fold) as generated, identical across arms,
+                # so scores stay paired index-for-index after merging
+                "runs": [{"seed": int(s), "n_test": int(len(te))}
+                         for s, _, _, te in runs],
+                "scores": per_arm,
+            }, fh, indent=2)
+        print(f"\nwrote {args.save_results} (cohort {fingerprint})")
 
     print("\nabundance-only is the bar: an arm shows spatial signal only if it")
     print("clears it. Majority baseline is the floor.")

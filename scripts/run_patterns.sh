@@ -48,8 +48,14 @@
 #               on one slot. An otherwise-identical job with -pe smp 4 sat
 #               unplaced for 24h while a CPU job asking DOUBLE the memory
 #               started in minutes.
-#   h_rt=8:0:0  headroom over the ~2-4h estimate. Longer walltimes are harder to
-#               place, so do not inflate this further without reason.
+#   h_rt=12:0:0 headroom over the estimate, and deliberately NOT trimmed to help
+#               placement. A shorter request places sooner but a run that gets
+#               killed at the wall produces nothing -- which has already happened
+#               twice here. Comparable jobs elsewhere on this cluster ask 5h/32G
+#               and place in minutes; this workload is heavier than those, so the
+#               wait is the cost of a run that can actually finish. If it still
+#               overruns, cut SEEDS rather than raise this further.
+#   mem=48G     likewise sized for the job, not for the queue.
 #   no -ac      `-ac allow=X` NARROWS eligibility to one node class. Free GPUs
 #               were seen on both E and L nodes, and jobs here have run on both
 #               with no allow= flag, so restricting would shrink the pool.
