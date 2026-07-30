@@ -31,7 +31,7 @@
 # =============================================================================
 
 #$ -N pat_seed
-#$ -l h_rt=5:0:0
+#$ -l h_rt=1:0:0
 #$ -l mem=48G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
@@ -50,15 +50,54 @@ mkdir -p /home/ucabim3/Scratch/logs "$RESULTS"
 # SGE array tasks are 1-based; seeds are 0-based.
 SEED=$(( SGE_TASK_ID - 1 ))
 
+# LEARNING-CURVE MODE. Set SIZES to a space-separated list and the array task
+# indexes the LIST rather than the seed -- one cohort size per task, all on the
+# same seed. Does macro-F1 rise with n (more slides would help) or sit flat at
+# the collapse floor (the limit is representational, and the full 1133-slide
+# cohort will not rescue it)?
+#
+#     qsub -t 1-5 -v SIZES="40 60 80 100 113",RESULT_TAG=curve run_patterns_array.sh
+#
+# Each point gets its own cohort fingerprint, so combine_results.py will refuse
+# to pool them -- correct, they are different experiments. Read them separately.
+SUBSAMPLE=""
+if [ -n "${SIZES:-}" ]; then
+    SIZE_ARR=($SIZES)
+    IDX=$(( SGE_TASK_ID - 1 ))
+    if [ "$IDX" -ge "${#SIZE_ARR[@]}" ]; then
+        echo "FATAL: task $SGE_TASK_ID has no entry in SIZES=($SIZES)" >&2
+        exit 1
+    fi
+    SUBSAMPLE="--subsample ${SIZE_ARR[$IDX]}"
+    SEED="${CURVE_SEED:-0}"
+    echo "LEARNING CURVE: task $SGE_TASK_ID -> ${SIZE_ARR[$IDX]} slides, seed $SEED"
+fi
+
 EPOCHS="${EPOCHS:-150}"
+# Patience MUST scale with EPOCHS. Training is full-batch -- one optimiser step
+# per epoch -- so with patience 20 a run ends around step 40 regardless of the
+# cap. Raising --epochs without raising this tests nothing. ~10% of the cap.
+PATIENCE="${PATIENCE:-$(( EPOCHS / 10 > 20 ? EPOCHS / 10 : 20 ))}"
 FOLDS="${FOLDS:-5}"
 TASK="${TASK:-pattern4}"
 RPB="${RPB:-16}"
+RESULT_TAG="${RESULT_TAG:-}"
 
 echo "=== $(date) on $(hostname) ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
     || echo "WARNING: no GPU visible -- this will not finish in the walltime"
-echo "array task $SGE_TASK_ID -> SEED $SEED | task=$TASK folds=$FOLDS epochs=$EPOCHS"
+echo "array task $SGE_TASK_ID -> SEED $SEED | task=$TASK folds=$FOLDS" \
+     "epochs=$EPOCHS patience=$PATIENCE"
+
+# RESULT_TAG keeps a different configuration in its own directory. Merging a
+# 1000-epoch run with a 150-epoch one would pool two different experiments;
+# combine_results.py refuses on the epochs mismatch, but separate directories
+# make the intent obvious rather than relying on the guard.
+OUT_DIR="$RESULTS${RESULT_TAG:+/$RESULT_TAG}"
+mkdir -p "$OUT_DIR"
+
+RESULT_NAME="${TASK}_seed${SEED}"
+[ -n "$SUBSAMPLE" ] && RESULT_NAME="${TASK}_n${SIZE_ARR[$(( SGE_TASK_ID - 1 ))]}_seed${SEED}"
 
 python -u train_patterns.py \
     --graph-cache /home/ucabim3/Scratch/graph_cache \
@@ -66,9 +105,11 @@ python -u train_patterns.py \
     --task "$TASK" \
     --regions-per-batch "$RPB" \
     --epochs "$EPOCHS" \
+    --patience "$PATIENCE" \
     --folds "$FOLDS" \
     --seed "$SEED" \
-    --save-results "$RESULTS/${TASK}_seed${SEED}.json"
+    $SUBSAMPLE \
+    --save-results "$OUT_DIR/${RESULT_NAME}.json"
 
 echo "=== done: $(date) ==="
 echo "when all tasks finish:  python combine_results.py $RESULTS"

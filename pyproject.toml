@@ -29,9 +29,17 @@ dependencies = [
     "tqdm",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# This repo is a set of CLI scripts (train_patterns.py, precompute_graphs.py,
+# stats_table.py) plus the `graphs/` package -- it is not a library anyone
+# installs. `package = false` tells uv to manage dependencies only and skip
+# building the project itself.
+#
+# Without it, uv invokes hatchling, which looks for a directory matching the
+# project name (`cell_hypergraphs/`), finds none, and fails the whole sync. The
+# scripts are run from the repo root, so the CWD is already on sys.path and
+# `import graphs` / `import models` resolve without an install.
+[tool.uv]
+package = false
 
 # ─── PyTorch CUDA build ───────────────────────────────
 [[tool.uv.index]]

@@ -160,7 +160,8 @@ def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
 
 
 def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, seed,
-                   abundance=None, device="cpu", patience=20, class_weight=None):
+                   abundance=None, device="cpu", patience=20, class_weight=None,
+                   select_on="macro_f1"):
     """Train on `tr`, early-stop on `va`, score `te`. Returns (accuracy, macro-F1).
 
     class_weight: per-class loss weights (inverse frequency) so the model is not
@@ -169,6 +170,20 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     Early stopping uses the VAL fold only, never the test fold, so test stays
     untouched until the final read.
 
+    select_on: WHICH validation metric picks the snapshot, and it matters more
+    than it looks. With a 44% majority class, a collapsed model scores 0.44 val
+    ACCURACY on its first update. Genuine learning then temporarily LOWERS
+    accuracy while the minority classes get sorted out -- so selecting on
+    accuracy snapshots the collapsed model immediately, patience expires, and
+    the run ends having learned nothing. Observed directly: best@2, stop@22
+    against a 200-epoch cap.
+
+    macro_f1 does not reward collapse -- a one-class predictor scores the floor
+    (2p/(p+1)/n_classes, ~0.153 here) -- so improvement on it tracks real
+    learning. It is also consistent with the inverse-frequency class weights
+    already used in the loss; selecting on accuracy while training on a balanced
+    objective optimises one thing and stops on another.
+
     MEMORY: each slide's loss is backwarded immediately and the gradients
     accumulate in .grad, rather than summing every slide's loss into one graph
     and backwarding once at the end. Identical arithmetic -- the gradient of a
@@ -176,6 +191,8 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     graph instead of the whole training fold's. Summing first silently defeated
     MILClassifier's regions_per_batch cap, which bounds a single slide only.
     """
+    if select_on not in ("acc", "macro_f1"):
+        raise ValueError(f"select_on must be 'acc' or 'macro_f1', got {select_on!r}")
     set_seed(seed)
     model = model.to(device)
     labels_t = labels_t.to(device)
@@ -221,7 +238,8 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     # Safe because these models have no running buffers (no BatchNorm), so
     # state_dict fully captures them.
     best_val, best_state, since = -1.0, None, 0
-    for _ in range(epochs):
+    stopped_at, best_epoch = epochs, 0
+    for ep in range(1, epochs + 1):
         model.train()
         opt.zero_grad()
         for i in tr:
@@ -231,18 +249,21 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         opt.step()
         model.eval()
         with torch.no_grad():
-            va_acc = float((preds(va) == y_np[va]).mean())
-            if va_acc > best_val:
-                best_val, since = va_acc, 0
+            vp = preds(va)
+            score = (float((vp == y_np[va]).mean()) if select_on == "acc"
+                     else macro_f1(vp, y_np[va], n_classes))
+            if score > best_val:
+                best_val, since, best_epoch = score, 0, ep
                 best_state = {k: v.detach().clone()
                               for k, v in model.state_dict().items()}
             else:
                 since += 1
                 if since >= patience:
+                    stopped_at = ep
                     break
 
     if best_state is None:                      # never improved on -1.0
-        return 0.0, 0.0
+        return 0.0, 0.0, stopped_at, best_epoch
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
@@ -250,7 +271,42 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         # predictor scores respectable accuracy but near-floor macro-F1, so the
         # pair makes collapse visible where accuracy alone cannot.
         tp = preds(te)
-        return float((tp == y_np[te]).mean()), macro_f1(tp, y_np[te], n_classes)
+        return (float((tp == y_np[te]).mean()),
+                macro_f1(tp, y_np[te], n_classes), stopped_at, best_epoch)
+
+
+def subsample_cohort(y, patient, target_n, seed=0):
+    """Indices of a patient-grouped, class-stratified subsample of ~target_n.
+
+    For learning curves: train at 40, 60, 80, ... slides and see whether
+    macro-F1 trends upward with n. A rising curve says more data would help and
+    the full cohort is worth waiting for; a curve flat at the collapse floor
+    says the limit is representational, not sample size, and no amount of extra
+    slides will fix it. That distinction is not settleable by argument.
+
+    Subsamples the same way folds are built -- whole patients, balanced across
+    classes -- so the smaller cohort is a scaled-down version of the real one
+    rather than a differently-biased one. Class proportions are preserved as
+    closely as whole-patient granularity allows.
+    """
+    rng = np.random.default_rng(seed)
+    pats = {}
+    for i, p in enumerate(patient):
+        pats.setdefault(p, []).append(i)
+    plist = list(pats)
+    plabel = {p: np.bincount([y[i] for i in pats[p]]).argmax() for p in plist}
+
+    frac = target_n / len(y)
+    keep = []
+    for c in sorted(set(plabel.values())):
+        cp = [p for p in plist if plabel[p] == c]
+        rng.shuffle(cp)
+        # at least one patient per class, or the class vanishes and the task
+        # silently changes shape
+        take = max(1, int(round(len(cp) * frac)))
+        keep.extend(cp[:take])
+    idx = sorted(i for p in keep for i in pats[p])
+    return idx
 
 
 def corrected_t_test(diffs, n_test, n_train):
@@ -338,6 +394,22 @@ def main():
                          "abundance-only always runs as the control")
     ap.add_argument("--hidden", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--subsample", type=int, default=None,
+                    help="train on a patient-grouped, class-stratified subsample "
+                         "of ~N slides. For learning curves: does macro-F1 rise "
+                         "with n, or is it flat at the collapse floor?")
+    ap.add_argument("--subsample-seed", type=int, default=0,
+                    help="which subsample to draw; vary to average over draws")
+    ap.add_argument("--select-on", choices=["acc", "macro_f1"],
+                    default="macro_f1",
+                    help="validation metric for early stopping. acc rewards "
+                         "majority collapse when classes are imbalanced; "
+                         "macro_f1 does not (see train_eval_mil docstring)")
+    ap.add_argument("--patience", type=int, default=20,
+                    help="epochs without val improvement before stopping. MUST "
+                         "scale with --epochs: training is full-batch, so an "
+                         "epoch is ONE optimiser step, and patience 20 will end "
+                         "a run around step 40 no matter how high the cap is")
     ap.add_argument("--seeds", type=int, default=5,
                     help="each seed = a fresh patient->fold assignment AND init")
     ap.add_argument("--seed", type=int, default=None,
@@ -406,6 +478,22 @@ def main():
     # to settle task/arms/hyperparameters, then freeze those and run once on the
     # final cohort. Choosing when to stop BECAUSE a result looked good is
     # optional stopping, and no p-value here corrects for it.
+    # Subsample BEFORE the fingerprint, so a learning-curve point gets its own
+    # cohort identity and combine_results.py cannot pool a 60-slide run with a
+    # 113-slide one. They are different experiments by construction.
+    if args.subsample and args.subsample < len(y):
+        idx = subsample_cohort(np.array(y), patient, args.subsample,
+                               seed=args.subsample_seed)
+        slide_bags = [slide_bags[i] for i in idx]
+        slide_abund = [slide_abund[i] for i in idx]
+        slide_ids = [slide_ids[i] for i in idx]
+        patient = [patient[i] for i in idx]
+        y = [y[i] for i in idx]
+        n = len(y)
+        print(f"SUBSAMPLED to {n} slides ({len(set(patient))} patients), "
+              f"target {args.subsample}, subsample-seed {args.subsample_seed} "
+              f"-- learning-curve point, NOT the full cohort")
+
     fingerprint = hashlib.sha1("\n".join(sorted(slide_ids)).encode()).hexdigest()[:10]
     print(f"cohort {fingerprint} | {len(files)} cached slides | {n} have a label "
           f"| {len(set(patient))} unique patients")
@@ -521,17 +609,26 @@ def main():
                 m = AbundanceOnly(abund.shape[1], 32, n_classes)
                 r = train_eval_mil(m, None, y, tr, va, te, n_classes, args.epochs,
                                    0.01, s, abundance=abund,
-                                   device=args.device, class_weight=class_weight)
+                                   device=args.device, class_weight=class_weight,
+                                   patience=args.patience,
+                                   select_on=args.select_on)
             else:
                 m = MILClassifier(arm, in_dim, hidden[arm], n_classes,
                                   regions_per_batch=args.regions_per_batch)
                 r = train_eval_mil(m, bags, y, tr, va, te, n_classes, args.epochs,
                                    0.01, s, device=args.device,
-                                   class_weight=class_weight)
-            scores.append(r)
+                                   class_weight=class_weight,
+                                   patience=args.patience,
+                                   select_on=args.select_on)
+            scores.append(r[:2])
             el = time.time() - t_arm
+            # stop@ / best@ reveal whether --epochs actually bound. If stop@ is
+            # far below the cap, the run ended on PATIENCE and raising the cap
+            # alone changes nothing -- patience has to rise with it.
+            cap = "CAP" if r[2] >= args.epochs else "patience"
             print(f"    [{arm}] run {j}/{len(runs)} (seed {s}) "
                   f"acc={r[0]:.3f} f1={r[1]:.3f} | "
+                  f"stop@{r[2]} best@{r[3]} ({cap}) | "
                   f"{el / j:.0f}s/run | eta {(len(runs) - j) * el / j / 60:.0f}min",
                   flush=True)
         a = np.array(scores)                      # (n_runs, 2) = acc, macro-F1
@@ -541,9 +638,15 @@ def main():
     n_te = float(np.mean([len(te) for _, _, _, te in runs]))
     n_tr = float(np.mean([len(tr) for _, tr, _, _ in runs]))
 
+    # macro-F1 a majority predictor would score: one class gets F1 =
+    # 2p/(p+1) for p = its prevalence, every other class gets 0. Printing this
+    # floor makes collapse readable directly off the table -- accuracy alone
+    # cannot distinguish a model that learned nothing from one that did.
+    floor_f1 = (2 * maj / (maj + 1)) / n_classes
     print(f"=== test scores over seeds {seed_list} x {args.folds} folds "
           f"({len(runs)} runs/arm) ===")
-    print(f"  {'majority baseline':<18} acc {maj:.3f}")
+    print(f"  {'majority baseline':<18} acc {maj:.3f} | macroF1 {floor_f1:.3f} "
+          f"<- the collapse floor")
     ab, ab_f1 = eval_arm("abundance-only")
     print(f"  {'abundance-only':<18} acc {ab.mean():.3f} +- {ab.std():.3f}"
           f" | macroF1 {ab_f1.mean():.3f}")
@@ -558,8 +661,21 @@ def main():
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
         print(f"  {arm:<18} acc {sc.mean():.3f} +- {sc.std():.3f}"
               f" | macroF1 {f1.mean():.3f}")
-        print(f"  {'':<18} vs abundance {mean_d:+.3f} ({sig}, corrected) "
+        # Express the difference in TEST SLIDES as well as accuracy. With ~23
+        # slides per fold, accuracy moves in steps of 1/23 = 0.043, so a "+0.044"
+        # is one slide. Stating that inline stops a sub-slide difference reading
+        # as an effect, however small the p-value looks.
+        slides = mean_d * n_te
+        print(f"  {'':<18} vs abundance {mean_d:+.3f} ({slides:+.1f} of "
+              f"{n_te:.0f} test slides) ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
+        if abs(slides) < 1.5:
+            print(f"  {'':<18} ^ under 1.5 slides per fold -- at or below the "
+                  f"resolution of this test set, regardless of p")
+        if f1.mean() < 1.25 * floor_f1:
+            print(f"  {'':<18} ^ macroF1 {f1.mean():.3f} is at the "
+                  f"majority-collapse floor ({floor_f1:.3f}): this arm is "
+                  f"predicting one class, not learning")
 
     if args.save_results:
         # Everything combine_results.py needs to merge parts SAFELY. The cohort
@@ -572,6 +688,10 @@ def main():
             json.dump({
                 "cohort": fingerprint,
                 "n_slides": n,
+                # recorded so a learning curve can be plotted straight from the
+                # JSONs, and so a subsampled run is never mistaken for a full one
+                "subsample": args.subsample,
+                "subsample_seed": args.subsample_seed,
                 "n_patients": len(set(patient)),
                 "task": args.task,
                 "classes": classes,
