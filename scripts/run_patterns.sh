@@ -7,12 +7,20 @@
 # anything from that one.
 #
 # WHY THESE SETTINGS
-#   --seeds 10        10 seeds x 5 folds = 50 runs/arm. Each seed is a fresh
+#   --seeds 3         3 seeds x 5 folds = 15 runs/arm. Each seed is a fresh
 #                     patient->fold assignment AND init, so the spread reflects
 #                     which patients land in test -- the dominant variance at
 #                     n~113 -- not just initialisation noise. The corrected
-#                     t-test needs a reasonable number of paired runs to say
-#                     anything; at 5 runs it is on df=4 and near-meaningless.
+#                     t-test then runs on df=14, which is thin but usable; at 5
+#                     runs it is df=4 and near-meaningless.
+#
+#                     10 seeds (50 runs) would be better but does NOT fit. The
+#                     smoke test measured ~670s/run (pw) and ~845s/run (hg) at
+#                     10 epochs on 4 CPU cores -- about 1.3s per slide
+#                     forward+backward, 13x slower than a synthetic benchmark
+#                     suggested. Scaled to 5 folds, ~50 epochs and 50 runs that
+#                     is ~20h+ even on GPU. Raise seeds only after a completed
+#                     run tells you the real per-run cost at these settings.
 #   --epochs 150      patience is 20, so early stopping decides when to stop.
 #                     A LOW epoch cap is not a neutral saving: pw-knn and hg-knn
 #                     may converge at different rates, so truncating can
@@ -24,12 +32,15 @@
 #                     multifocal slide into a focal-looking one. That would
 #                     damage the exact signal being measured.
 #
-# COST. Measured per-slide forward+backward:
-#     pw-knn  cpu  98ms   gpu 17ms      (5.7x)
-#     hg-knn  cpu 258ms   gpu 24ms     (10.7x)
-# On GPU the full sweep is ~2-4h. On CPU it is ~40h+ and will NOT finish, which
-# is why gpu=1 is requested here rather than being optional. hg-knn dominates:
-# DeepSetsHyperConv scatters over ~720k incidences per slide.
+# COST, from the smoke test on REAL slides (4 CPU cores, 10 epochs, 3 folds):
+#     pw-knn  ~670 s/run      hg-knn  ~845 s/run
+# i.e. ~1.3s per slide forward+backward. A synthetic benchmark suggested 98ms;
+# the real slides are ~13x heavier, so trust the measured figure. GPU was 5.7x
+# (pw) and 10.7x (hg) faster on that synthetic data -- treat as indicative.
+#
+# 15 runs/arm at these settings should land inside the 12h wall on GPU. It will
+# NOT finish on CPU, which is why gpu=1 is required rather than optional. Watch
+# the ETA in the log after run 1 and qdel early if it is going to overrun.
 #
 # REQUEST SHAPE is tuned for placement:
 #   mem=48G     on ONE slot -- no -pe. Asking for N cores means N FREE CORES ON
@@ -54,7 +65,7 @@
 # =============================================================================
 
 #$ -N patterns
-#$ -l h_rt=8:0:0
+#$ -l h_rt=12:0:0
 #$ -l mem=48G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
@@ -75,7 +86,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
 # Overridable, but the defaults ARE the defensible configuration. Lower them
 # only for a deliberate pilot, and then use run_patterns_fast.sh instead so the
 # distinction stays visible in the logs.
-SEEDS="${SEEDS:-10}"
+SEEDS="${SEEDS:-3}"
 EPOCHS="${EPOCHS:-150}"
 FOLDS="${FOLDS:-5}"
 TASK="${TASK:-pattern4}"
