@@ -7,12 +7,13 @@
 # minutes rather than the 24h+ a gpu=1 request has waited here.
 #
 # WHY ITS NUMBERS ARE NOT USABLE
-#   --seeds 1     5 runs/arm puts the corrected t-test on df=4. You will get a
-#                 p-value; it will not mean much.
-#   --epochs 30   patience is 20, so early stopping can barely engage. Runs are
-#                 cut off possibly mid-convergence, and pw-knn / hg-knn may
-#                 converge at different rates -- so a null here could be an
-#                 artefact of truncation rather than a finding about topology.
+#   --seeds 1     3 runs/arm puts any significance test on df=2. Meaningless.
+#   --folds 3     training folds of ~38 slides instead of ~68 (one fold is held
+#                 for validation, so training gets k-2 of k).
+#   --epochs 10   patience is 20, so early stopping NEVER engages -- every run is
+#                 truncated mid-convergence. pw-knn and hg-knn may converge at
+#                 different rates, so a difference here says nothing about
+#                 topology, only about which arm learns faster in 10 epochs.
 #
 # WHAT IT IS GOOD FOR
 #   - confirming train_patterns.py completes on the real cache (the last full
@@ -31,12 +32,19 @@
 
 #$ -N pat_fast
 #$ -l h_rt=2:0:0
-#$ -l mem=32G
+#$ -l mem=8G
+#$ -pe smp 4
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
 #$ -o /home/ucabim3/Scratch/logs/patterns_fast.out
 #$ -e /home/ucabim3/Scratch/logs/patterns_fast.err
 
 # No gpu=1 on purpose: this exists to start immediately.
+#
+# DO request cores here, unlike run_patterns.sh. The single-slot request there
+# exists because "N free cores ON THE SAME GPU HOST" is what kept a gpu=1 job
+# unplaced for 24h. A CPU job has no such constraint -- any node will do, and a
+# 4-slot CPU job here placed in minutes. Dropping to one slot cost 4x the
+# compute for no scheduling benefit. mem is PER SLOT on Myriad, so 8G x 4 = 32G.
 
 ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/segmentation/cellvit_env.sh
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
@@ -46,9 +54,20 @@ python -c "import torch" 2>/dev/null || {
 mkdir -p /home/ucabim3/Scratch/logs
 echo "=== $(date) on $(hostname) ==="
 
+# Match torch's thread count to the slots SGE actually granted. Without this
+# torch either uses one thread (wasting the allocation) or oversubscribes the
+# node (bad citizenship, and the scheduler may throttle it).
+export OMP_NUM_THREADS="${NSLOTS:-1}"
+export MKL_NUM_THREADS="${NSLOTS:-1}"
+echo "slots granted: ${NSLOTS:-1} (torch threads set to match)"
+
+# A smoke test only has to prove the thing runs and reveal the per-run cost, so
+# it is deliberately minimal: 3 folds not 5, 10 epochs not 30. Training folds are
+# thinner than the proper run uses, which is fine precisely because these numbers
+# are not reportable.
 SEEDS="${SEEDS:-1}"
-EPOCHS="${EPOCHS:-30}"
-FOLDS="${FOLDS:-5}"
+EPOCHS="${EPOCHS:-10}"
+FOLDS="${FOLDS:-3}"
 TASK="${TASK:-pattern4}"
 # rpb=4 measured ~1.3x faster than 16 on CPU (cache locality). Cannot change a
 # result -- region boundaries are never split.
