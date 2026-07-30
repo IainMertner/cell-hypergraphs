@@ -8,9 +8,12 @@
 # to seed 1 computed inline. Arms stay paired run-for-run.
 #
 # WHY BOTHER
-#   placement   a ~4h task places far more easily than a 12h one, and array
-#               tasks are scheduled independently so they trickle in rather
-#               than waiting for one big window.
+#   placement   ONE seed is a third of the monolith's work, so h_rt is a third
+#               of its 12h (plus headroom) -- 5h. That is the whole point: this
+#               is a genuinely smaller request, not the same request relabelled.
+#               Array tasks are also scheduled independently, so they trickle in
+#               rather than all waiting for one large window.
+#               mem stays at 48G -- one seed still loads the entire graph cache.
 #   resilience  a walltime kill or a node failure costs ONE seed, not the whole
 #               sweep. Previously a 12h job that died at 11h produced nothing.
 #   visibility  partial results land as tasks finish, instead of one blind wait.
@@ -28,7 +31,7 @@
 # =============================================================================
 
 #$ -N pat_seed
-#$ -l h_rt=12:0:0
+#$ -l h_rt=5:0:0
 #$ -l mem=48G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs

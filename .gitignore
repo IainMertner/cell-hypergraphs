@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dissertation prose -- not code, and not for the public repo
+WRITEUP.md
