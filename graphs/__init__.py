@@ -10,6 +10,10 @@ the topology differs. The pairwise arm carries `edge_index`, the hypergraph arm
 Arms
 ----
 pw-knn      BASELINE, field-standard k-NN cell graph. Cardinality 2.
+pw-radius   CONTROL for hg-radius: pairwise edges within the SAME radius, so
+            the neighbourhood is the same cells in pairwise form. Without it,
+            hg-radius vs pw-knn confounds hypergraph-vs-pairwise with
+            radius-vs-kNN.
 hg-knn      PRIMARY, {cell + its k nearest} as one hyperedge -- the direct
             higher-order analogue: same k, same neighbours, grouped not paired.
             Cardinality FIXED at k+1 = 6.
@@ -40,12 +44,12 @@ trend argument than the design assumed. Worth knowing before reinstating them.
 """
 
 from . import cells, common
-from .constructions import pw_knn, hg_knn, hg_radius
+from .constructions import pw_knn, pw_radius, hg_knn, hg_radius
 from .common import (N_TYPES, microns_to_px,
                      structural_stats, print_stats_table)
 from .cells import load_cache, regions, region_mask, grid_tiles, zscore_morph
 
-ARMS = ["pw-knn", "hg-knn", "hg-radius"]
+ARMS = ["pw-knn", "pw-radius", "hg-knn", "hg-radius"]
 
 # What runs unless you ask otherwise. Kept distinct from ARMS so reinstating a
 # construction does not silently enlarge the default experiment.
@@ -90,6 +94,12 @@ def build(arm, centroids, types, mpp, morph=None, params=None):
         return pw_knn.build(centroids, types, p["k"], cap, morph)
     if arm == "hg-knn":
         return hg_knn.build(centroids, types, p["k"], cap, morph)
+    if arm == "pw-radius":
+        # SAME radius as hg-radius, so the neighbourhoods contain the same
+        # cells and only the representation differs. This is the control that
+        # separates "hypergraph structure" from "radius neighbourhood".
+        return pw_radius.build(centroids, types,
+                               microns_to_px(p["hg_radius_um"], mpp), morph)
     if arm == "hg-radius":
         # its OWN radius, not the 35um cap -- see hg_radius.py for the measured
         # cardinalities at 10 / 12.5 / 35um and why 12.5 is the setting
