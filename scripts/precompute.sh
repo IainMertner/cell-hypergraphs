@@ -4,8 +4,16 @@
 # CPU job -- no GPU. Run this once; afterwards run_patterns.sh loads the cache
 # and runs in minutes.
 #
-# SUBMIT:
-#     qsub precompute.sh
+# *** NEVER run precompute_graphs.py directly on a login node. *** It is a
+# multi-hour, multi-core job over every slide. Login nodes are shared and their
+# watchdog will kill it and flag the account. ALWAYS qsub.
+#
+# SUBMIT -- default arms (pw-knn hg-knn):
+#     qsub scripts/precompute.sh
+#
+# SUBMIT -- adding an arm. Existing slides are TOPPED UP with just the new arm
+# rather than rebuilt, so this costs one arm, not the whole cache:
+#     qsub -v ARMS="pw-knn hg-knn hg-radius" scripts/precompute.sh
 # =============================================================================
 
 #$ -N precompute
@@ -26,13 +34,16 @@ mkdir -p /home/ucabim3/Scratch/logs
 
 echo "=== $(date) on $(hostname) ==="
 
+# Arms default to train_patterns.py's DEFAULT_ARMS (pw-knn hg-knn). Override
+# with -v ARMS="..." at submit time so this file does not need editing.
+ARMS="${ARMS:-}"
+echo "arms: ${ARMS:-<default>}"
+
 # -u = unbuffered, so per-slide progress appears in the log live rather than
-# only when the job ends. Arms default to pw-knn + hg-knn -- the one comparison
-# the project is trying to answer. To add an arm later, rerun this with
-# `--arms hg-radius`: existing slides are topped up with just the new arm rather
-# than rebuilt, so it costs one arm, not the whole cache.
+# only when the job ends.
 python -u precompute_graphs.py \
     --cache-root /home/ucabim3/Scratch/cellvit_out \
-    --out /home/ucabim3/Scratch/graph_cache
+    --out /home/ucabim3/Scratch/graph_cache \
+    ${ARMS:+--arms $ARMS}
 
 echo "=== done: $(date) ==="
