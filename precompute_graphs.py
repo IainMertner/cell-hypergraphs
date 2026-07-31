@@ -50,7 +50,7 @@ from graphs import (build, load_cache, regions as find_regions, N_TYPES,
 # tensors, so an encoding change is just as invalidating as a geometry change,
 # and unlike geometry it cannot be spotted by eye from the stored parameters.
 GEOMETRY_KEYS = ("tile_px", "min_cells", "min_infl", "feature_version",
-                 "k", "radius_um")
+                 "k", "radius_um", "hg_radius_um")
 
 
 def slide_id(path):
@@ -58,9 +58,25 @@ def slide_id(path):
 
 
 def geometry_mismatch(old, new):
-    """Keys where a cached param set disagrees with the current one."""
-    return {k: (old.get(k, "<missing>"), new[k])
-            for k in GEOMETRY_KEYS if old.get(k, "<missing>") != new[k]}
+    """(changed, added) -- keys where a cached param set disagrees, and keys the
+    cache predates entirely.
+
+    CHANGED is fatal: the cached graphs were built under a different setting and
+    are not comparable with new ones.
+
+    ADDED is not. A key absent from the cached params means the cache was built
+    before that parameter existed -- so nothing in it used any value for it, and
+    topping up is consistent. This is what lets a new construction (hg-radius,
+    which introduced hg_radius_um) be added to an existing cache without forcing
+    a full rebuild of every slide. Reported, not silent.
+    """
+    changed, added = {}, {}
+    for k in GEOMETRY_KEYS:
+        if k not in old:
+            added[k] = new[k]
+        elif old[k] != new[k]:
+            changed[k] = (old[k], new[k])
+    return changed, added
 
 
 def build_one_slide(cache_path, arms, tile_px, min_cells, min_infl):
@@ -106,21 +122,26 @@ def main():
     params = dict(arms=list(args.arms), tile_px=args.tile_px,
                   min_cells=args.min_cells, min_infl=args.min_infl,
                   feature_version=FEATURE_VERSION,
-                  **{k: PARAMS[k] for k in ("k", "radius_um")})
+                  **{k: PARAMS[k] for k in ("k", "radius_um", "hg_radius_um")})
     params_path = os.path.join(args.out, "_params.pt")
 
     # Check the manifest BEFORE building anything: a geometry change means the
     # cached graphs and the ones we are about to build are not comparable, and
     # topping up would silently mix them. Abort with the offending keys named.
     if os.path.exists(params_path):
-        bad = geometry_mismatch(torch.load(params_path), params)
-        if bad:
+        changed, added = geometry_mismatch(torch.load(params_path), params)
+        if changed:
             lines = "\n".join(f"    {k}: cached {o!r} -> requested {n!r}"
-                              for k, (o, n) in sorted(bad.items()))
+                              for k, (o, n) in sorted(changed.items()))
             raise SystemExit(
                 f"cache {args.out}/ was built with different parameters:\n{lines}\n"
                 "  the cached graphs are stale. Delete the cache dir and rerun, "
                 "or pass a fresh --out.")
+        if added:
+            print("note: cache predates " + ", ".join(sorted(added))
+                  + " -- nothing in it used those, so topping up is consistent. "
+                  + "Now recording "
+                  + ", ".join(f"{k}={v!r}" for k, v in sorted(added.items())))
 
     print(f"arms: {args.arms}")
     print(f"params: {params}\n")
@@ -139,10 +160,10 @@ def main():
         if existing is not None:
             # per-file check too: the manifest can be absent or lag behind if an
             # earlier run was interrupted, but every slide file carries its own
-            bad = geometry_mismatch(existing.get("params", {}), params)
-            if bad:
+            changed, _ = geometry_mismatch(existing.get("params", {}), params)
+            if changed:
                 lines = "\n".join(f"    {k}: cached {o!r} -> requested {n!r}"
-                                  for k, (o, n) in sorted(bad.items()))
+                                  for k, (o, n) in sorted(changed.items()))
                 raise SystemExit(
                     f"{out_path} was built with different parameters:\n{lines}\n"
                     "  delete the cache dir and rerun, or pass a fresh --out.")

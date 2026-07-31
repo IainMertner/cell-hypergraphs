@@ -9,14 +9,22 @@ the topology differs. The pairwise arm carries `edge_index`, the hypergraph arm
 
 Arms
 ----
-pw-knn   BASELINE, field-standard k-NN cell graph
-hg-knn   PRIMARY, {cell + its k nearest} as one hyperedge -- the direct
-         higher-order analogue: same k, same neighbours, grouped not paired
+pw-knn      BASELINE, field-standard k-NN cell graph. Cardinality 2.
+hg-knn      PRIMARY, {cell + its k nearest} as one hyperedge -- the direct
+            higher-order analogue: same k, same neighbours, grouped not paired.
+            Cardinality FIXED at k+1 = 6.
+hg-radius   MECHANISM TEST, all cells within r as one hyperedge. Cardinality
+            VARIES (median 6, max 15) at the same median as hg-knn.
 
-That pairing is the whole experiment. Holding k and the neighbour set fixed
-means the ONLY difference between the arms is whether a neighbourhood is
-represented as a set or as a collection of pairs, so a difference in performance
-is attributable to that and little else.
+pw-knn vs hg-knn holds k and the neighbour set fixed, so the only difference is
+set-vs-pairs. But note what it CANNOT test: hg-knn's cardinality is constant, so
+the sum-vs-mean mechanism -- sum preserves set-level counts that mean divides
+back out -- has no set-size variation to act on. A null there does not falsify
+the mechanism; it may just mean the construction cannot express it.
+
+hg-radius is the arm where cardinality varies, so it is where a mechanistic
+advantage should appear. Comparing hg-knn against hg-radius isolates cardinality
+VARIANCE from cardinality SCALE, since 12.5um is chosen to match hg-knn's median.
 
 Four further constructions (pw-delaunay, pw-clique, hg-delaunay, hg-radius,
 hg-knn+semantic) were removed once it was clear they only serve a follow-up
@@ -32,21 +40,28 @@ trend argument than the design assumed. Worth knowing before reinstating them.
 """
 
 from . import cells, common
-from .constructions import pw_knn, hg_knn
+from .constructions import pw_knn, hg_knn, hg_radius
 from .common import (N_TYPES, microns_to_px,
                      structural_stats, print_stats_table)
 from .cells import load_cache, regions, region_mask, grid_tiles, zscore_morph
 
-ARMS = ["pw-knn", "hg-knn"]
+ARMS = ["pw-knn", "hg-knn", "hg-radius"]
 
-# What runs unless you ask otherwise. Currently everything, but kept distinct
-# from ARMS so reinstating a construction does not silently enlarge the default
-# experiment -- one comparison at n~99 is already thin; a dozen uncorrected ones
-# would let something clear the control by chance.
+# What runs unless you ask otherwise. Kept distinct from ARMS so reinstating a
+# construction does not silently enlarge the default experiment.
+#
+# hg-radius is DELIBERATELY not a default. It exists to answer one question:
+# hg-knn has FIXED cardinality k+1, so the sum-vs-mean mechanism this project
+# rests on has no set-size variation to act on there. hg-radius varies (median 6,
+# max 15), so it is where a mechanistic advantage should appear if it exists.
+# Run it explicitly:  --arms pw-knn hg-knn hg-radius
 DEFAULT_ARMS = ["pw-knn", "hg-knn"]
 
-# default construction parameters, in microns where applicable
-PARAMS = dict(k=5, radius_um=35.0)
+# default construction parameters, in microns where applicable.
+# hg_radius_um=12.5 puts hg-radius at the same MEDIAN cardinality as hg-knn (6),
+# so the two differ in cardinality VARIANCE rather than in scale -- which is the
+# comparison that isolates the mechanism.
+PARAMS = dict(k=5, radius_um=35.0, hg_radius_um=12.5, max_size=None)
 
 # Bump whenever the NODE FEATURE encoding changes in a way that invalidates an
 # existing graph cache. precompute_graphs.py stores finished feature tensors,
@@ -75,4 +90,10 @@ def build(arm, centroids, types, mpp, morph=None, params=None):
         return pw_knn.build(centroids, types, p["k"], cap, morph)
     if arm == "hg-knn":
         return hg_knn.build(centroids, types, p["k"], cap, morph)
+    if arm == "hg-radius":
+        # its OWN radius, not the 35um cap -- see hg_radius.py for the measured
+        # cardinalities at 10 / 12.5 / 35um and why 12.5 is the setting
+        return hg_radius.build(centroids, types,
+                               microns_to_px(p["hg_radius_um"], mpp),
+                               morph, p["max_size"])
     raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")

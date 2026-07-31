@@ -144,7 +144,12 @@ def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
             maj = max(int((df.y == c).sum()) for c in classes)
             print(f"  majority baseline    {maj / n_tot:.3f}")
             print(f"  briskness-only rule  {best / n_tot:.3f}   "
-                  "<- abundance alone gets this far")
+                  "<- IN-SAMPLE oracle, not cross-validated")
+            print("    (fitted and scored on all slides, so it is an upper "
+                  "bound on what briskness\n     could give -- do NOT compare "
+                  "it directly to the cross-validated arm scores below.\n"
+                  "     The CV-fair abundance comparator is the abundance-only "
+                  "arm.)")
             if best / n_tot - maj / n_tot > 0.05:
                 print("  WARNING: briskness explains much of this target. It is "
                       "only partly a spatial task;\n           an arm must clear "
@@ -672,10 +677,6 @@ def main():
         if abs(slides) < 1.5:
             print(f"  {'':<18} ^ under 1.5 slides per fold -- at or below the "
                   f"resolution of this test set, regardless of p")
-        if f1.mean() < 1.25 * floor_f1:
-            print(f"  {'':<18} ^ macroF1 {f1.mean():.3f} is at the "
-                  f"majority-collapse floor ({floor_f1:.3f}): this arm is "
-                  f"predicting one class, not learning")
 
     if args.save_results:
         # Everything combine_results.py needs to merge parts SAFELY. The cohort
@@ -710,16 +711,6 @@ def main():
                 "scores": per_arm,
             }, fh, indent=2)
         print(f"\nwrote {args.save_results} (cohort {fingerprint})")
-
-    print("\nabundance-only is the bar: an arm shows spatial signal only if it")
-    print("clears it. Majority baseline is the floor.")
-    print("READING THE NUMBERS:")
-    print("  - macroF1 near floor with respectable acc = collapsed to majority.")
-    print("  - the +- is a spread, NOT a standard error: repeated-CV runs share")
-    print("    training data. Use the corrected p, which accounts for that")
-    print("    overlap (Nadeau & Bengio); a plain t-test here would overstate.")
-    print("  - at this n, treat p as indicative and read it with the win rate.")
-
 
 if __name__ == "__main__":
     main()
