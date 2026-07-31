@@ -180,8 +180,10 @@ def main():
     ap.add_argument("--patience", type=int, default=30)
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--compare-to", default=None,
-                    help="arm every other arm is tested against, paired per "
-                         "region. Default: the first arm listed")
+                    help="run the paired test against this arm. Off unless "
+                         "given, so a p-value only appears when you asked for "
+                         "one -- eyeballing it on every exploratory run is how "
+                         "you end up testing a hypothesis you formed afterwards")
     ap.add_argument("--capacity-ref", default=None,
                     help="arm whose parameter count the others are matched to. "
                          "Defaults to the first non-pw arm, which makes the "
@@ -300,8 +302,8 @@ def main():
         print(f"  {a:<20} acc {acc:.3f} +- {v[:, 0].std():.3f} "
               f"| macroF1 {f1:.3f} +- {v[:, 1].std():.3f}"
               + ("  [acc BELOW majority]" if acc < maj_acc else ""))
-    ref = args.compare_to or args.arms[0]
-    others = [a for a in args.arms if a != ref]
+    ref = args.compare_to
+    others = [a for a in args.arms if a != ref] if ref else []
     if others:
         nr = len(regions)
         print(f"\n=== paired against {ref} ===")
