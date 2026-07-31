@@ -154,15 +154,26 @@ REGION_DIM = 64
 
 
 def _readout(x, batch, n_regions):
-    """Per-region mean+sum pooling. batch[i] = region that node i belongs to.
+    """Per-region mean+sum+std pooling. batch[i] = region node i belongs to.
 
-    Mean captures composition, sum captures scale/count -- keeping both means a
-    region vector retains how MANY as well as what FRACTION, which matters for a
-    task with an abundance axis.
+    Mean is composition, sum is scale, std is DISPERSION -- how much local
+    structure varies across the region.
+
+    The third moment is not a refinement. Focal (one dense aggregate, most cells
+    isolated) and Diffuse (uniform moderate density) differ in the SPREAD of
+    per-cell density, not its centre, so a mean+sum readout cannot represent the
+    distinction the labels turn on however good the encoder is. Both are pooled
+    over ~2000 cells, which is where a per-node difference goes to die.
     """
     mean = global_mean_pool(x, batch, size=n_regions)
     summ = global_add_pool(x, batch, size=n_regions)
-    return torch.cat([mean, summ], dim=-1)          # (n_regions, 2*hidden)
+    # E[x^2] - E[x]^2, clamped because fp error takes it slightly negative.
+    # The epsilon is load-bearing: sqrt has an infinite gradient at 0, and a
+    # dead ReLU channel gives var EXACTLY 0, so sqrt(var) alone yields NaN.
+    var = (global_mean_pool(x * x, batch, size=n_regions)
+           - mean * mean).clamp(min=0)
+    return torch.cat([mean, summ, (var + 1e-6).sqrt()],
+                     dim=-1)                        # (n_regions, 3*hidden)
 
 
 class PairwiseRegionEncoder(nn.Module):
@@ -203,7 +214,7 @@ class PairwiseRegionEncoder(nn.Module):
         self.agg = agg
         self.c1 = Conv(in_dim, hidden)
         self.c2 = Conv(hidden, hidden)
-        self.proj = nn.Linear(2 * hidden, out_dim)
+        self.proj = nn.Linear(3 * hidden, out_dim)
         self.out_dim = out_dim
 
     def forward(self, x, edge_index, batch, n_regions):
@@ -239,7 +250,7 @@ class HyperRegionEncoder(nn.Module):
         self.agg = agg
         self.c1 = Conv(in_dim, hidden, back=back)
         self.c2 = Conv(hidden, hidden, back=back)
-        self.proj = nn.Linear(2 * hidden, out_dim)
+        self.proj = nn.Linear(3 * hidden, out_dim)
         self.out_dim = out_dim
 
     def forward(self, x, hyperedge_index, batch, n_regions, num_hyperedges):
