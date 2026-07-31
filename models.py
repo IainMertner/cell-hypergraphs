@@ -376,11 +376,16 @@ class MILClassifier(nn.Module):
         return torch.cat(vecs, dim=0)          # attached: gradients flow through all groups
 
     def forward(self, bag):
-        """bag: raw [(x, struct), ...] regions, or pre-packed groups from
-        pack_bag(). Prefer pre-packed -- packing here repeats identical work on
-        every epoch."""
+        """bag: raw regions, or pre-packed groups from pack_bag(). Prefer
+        pre-packed -- packing here repeats identical work on every epoch.
+
+        Raw regions are (x, struct), or (x, struct, family_id) for multi-family
+        arms; packed groups are 4-tuples (pairwise) or 5-tuples (hypergraph).
+        The arity test must accept BOTH raw widths or a 3-tuple region list gets
+        mistaken for pre-packed and fails somewhere unrelated.
+        """
         packed = (pack_bag(bag, self.is_pw, self.rpb)
-                  if bag and len(bag[0]) == 2 else bag)
+                  if bag and len(bag[0]) in (2, 3) else bag)
         region_vecs = self._encode_regions(packed)
         if self.pool_kind == "attention":
             slide_vec, att = self.pool(region_vecs)

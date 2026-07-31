@@ -43,13 +43,23 @@ def main():
     if args.slides:
         files = files[:args.slides]
 
+    # cached regions are (x, struct) or, for multi-family arms, (x, struct, fam)
     acc = {a: [] for a in arms}
+    fam_sizes = {}                       # arm -> family -> [cardinalities]
     for f in files:
         bags = torch.load(f)["bags"]
         for a in arms:
-            for x, struct in bags.get(a, []):
+            for g in bags.get(a, []):
+                x, struct = g[0], g[1]
                 acc[a].append(structural_stats(a, as_data(a, x, struct),
                                                int(x.shape[0])))
+                if len(g) > 2 and struct.numel():
+                    n_he = int(struct[1].max()) + 1
+                    sizes = np.bincount(struct[1].numpy(), minlength=n_he)
+                    fam = g[2].numpy()
+                    for k in np.unique(fam):
+                        fam_sizes.setdefault(a, {}).setdefault(
+                            int(k), []).extend(sizes[fam == k].tolist())
     n_reg = len(acc[arms[0]]) if arms else 0
     print(f"{len(files)} slides | {n_reg} regions per arm\n")
     if not n_reg:
@@ -75,6 +85,21 @@ def main():
     for a in arms:
         e = np.array([s["expansion"] for s in acc[a]])
         print(f"  {a:<18} {e.min():5.1f}x - {e.max():5.1f}x   (mean {e.mean():5.1f}x)")
+
+    # Multi-family arms need their families reported separately. A blended mean
+    # over a ~6-cell spatial family and a ~200-cell semantic one describes
+    # neither, and the gap between them is exactly what family-aware
+    # aggregation has to handle.
+    if fam_sizes:
+        print("\nper-family cardinality (0 = spatial, 1 = semantic):")
+        for a, fams in fam_sizes.items():
+            for k in sorted(fams):
+                s = np.array(fams[k])
+                cliq = int((s * (s - 1) // 2).sum())
+                print(f"  {a:<18} family {k}  n={len(s):>7,}  "
+                      f"mean {s.mean():6.1f}  median {np.median(s):5.0f}  "
+                      f"p99 {np.percentile(s, 99):6.0f}  max {s.max():5d}  "
+                      f"| clique {cliq:>12,} edges")
     print("\nA hypergraph advantage is mechanistic only if it tracks this "
           "ordering.\nRead the spread too: an arm whose ratio swings widely "
           "across regions is\nnot a stable point on the spectrum.")
