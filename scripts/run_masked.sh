@@ -7,6 +7,10 @@
 #     qsub scripts/run_masked.sh
 #     qsub -v FEATURES=none,ARMS="pw-knn hg-radius@sum2",REGIONS=20 scripts/run_masked.sh
 #
+# The paired test is off unless COMPARE_TO names a reference arm:
+#     qsub -l h_rt=2:0:0 -v REGIONS=50,ARMS="pw-radius@gin+deg hg-radius@deepsets2",\
+#     COMPARE_TO=pw-radius@gin+deg,CAPACITY_REF=hg-radius@deepsets2 scripts/run_masked.sh
+#
 # CPU-only: the models are small enough that a GPU buys minutes and costs an
 # hour in the queue. Add -l gpu=1 on the command line if you ever need one.
 
@@ -32,8 +36,13 @@ REGIONS="${REGIONS:-10}"
 SEEDS="${SEEDS:-3}"
 EPOCHS="${EPOCHS:-300}"
 FEATURES="${FEATURES:-morph}"      # none | type | morph | both
+# both off unless set. COMPARE_TO runs the paired test against that arm;
+# CAPACITY_REF pins the parameter target so runs stay comparable to each other
+COMPARE_TO="${COMPARE_TO:-}"
+CAPACITY_REF="${CAPACITY_REF:-}"
 
 echo "arms=$ARMS regions=$REGIONS seeds=$SEEDS epochs=$EPOCHS features=$FEATURES"
+echo "compare-to=${COMPARE_TO:-<none>} capacity-ref=${CAPACITY_REF:-<default>}"
 
 python -u train_masked.py \
     --graph-cache /home/ucabim3/Scratch/graph_cache \
@@ -41,6 +50,8 @@ python -u train_masked.py \
     --regions "$REGIONS" \
     --seeds "$SEEDS" \
     --epochs "$EPOCHS" \
-    --features "$FEATURES"
+    --features "$FEATURES" \
+    ${COMPARE_TO:+--compare-to "$COMPARE_TO"} \
+    ${CAPACITY_REF:+--capacity-ref "$CAPACITY_REF"}
 
 echo "=== done: $(date) ==="
