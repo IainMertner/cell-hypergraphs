@@ -47,11 +47,21 @@ class DeepSetsHyperConv(nn.Module):
     Stages: phi (per-member MLP) -> sum-pool (+ log set size, so the model can
     account for cardinality rather than be destabilised by it) -> rho (MLP on
     the set summary) -> scatter back to members -> combine with own features.
+
+    RETURN PATH: `back` is "mean" (historical default) or "sum". Mean averages
+    over the hyperedges containing a node and so DISCARDS node degree -- how
+    many neighbourhoods a cell participates in, which is a density signal.
+    GCNConv retains node degree through its 1/sqrt(d_i d_j) term, so with
+    back="mean" the hypergraph arms compete without something the pairwise
+    baseline has. Note this docstring argues above that mean "divides that
+    information back out", then did exactly that on the return path. Exposed as
+    a variant so it is measured rather than assumed.
     """
 
-    def __init__(self, in_dim, out_dim, hidden=None):
+    def __init__(self, in_dim, out_dim, hidden=None, back="mean"):
         super().__init__()
         hidden = hidden or out_dim
+        self.back = back
         self.phi = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
         self.rho = nn.Sequential(nn.Linear(hidden + 1, hidden), nn.ReLU())
         self.out = nn.Linear(hidden + in_dim, out_dim)
@@ -70,7 +80,8 @@ class DeepSetsHyperConv(nn.Module):
         size = scatter(torch.ones_like(edge_idx, dtype=x.dtype), edge_idx,
                        dim=0, dim_size=num_hyperedges, reduce="sum").unsqueeze(1)
         he = self.rho(torch.cat([he, size.log1p()], dim=1))
-        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n, reduce="mean")
+        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n,
+                       reduce=self.back)
         return self.out(torch.cat([back, x], dim=1))
 
 class SumHyperConv(nn.Module):
@@ -97,12 +108,32 @@ class SumHyperConv(nn.Module):
     same range as GCNConv. Run it against DeepSetsHyperConv on the SAME
     construction to separate "sum aggregation helps" from "learned set
     aggregation is unaffordable at this n" -- currently confounded everywhere.
+
+    THE RETURN PATH IS A SEPARATE CHOICE, and `back` controls it:
+
+      back="mean"  average over the hyperedges containing a node. Magnitude does
+                   not scale with node degree -- but node degree is DISCARDED,
+                   and node degree is a density signal: how many neighbourhoods
+                   a cell participates in.
+      back="sum"   sum over them. Node degree survives into the representation.
+
+    This matters more than it looks. GCNConv keeps node degree via its
+    1/sqrt(d_i d_j) normalisation, and pw_knn symmetrises its edges so degree
+    genuinely varies. With back="mean" the hypergraph arms compete WITHOUT a
+    density signal the pairwise baseline has -- and on a topology-only task
+    (--features none) that is most of the available signal.
+
+    back="mean" was inherited from DeepSetsHyperConv, whose docstring argues
+    that mean "divides that information back out" while doing exactly that four
+    lines later. Both are exposed as variants so the choice is measured rather
+    than assumed.
     """
 
-    def __init__(self, in_dim, out_dim, hidden=None):
+    def __init__(self, in_dim, out_dim, hidden=None, back="mean"):
         super().__init__()
         # signature matches DeepSetsHyperConv so the encoders are interchangeable;
         # `hidden` is unused -- there is no intermediate representation
+        self.back = back
         self.out = nn.Linear(2 * in_dim, out_dim)
 
     def forward(self, x, hyperedge_index, num_hyperedges=None):
@@ -117,10 +148,8 @@ class SumHyperConv(nn.Module):
         # is exactly the information mean pooling and clique expansion destroy.
         he = scatter(x[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
-        # MEAN back to members, so magnitude does not also scale with how many
-        # hyperedges a node happens to belong to (a node-degree effect, not a
-        # set-size one). Keeps the cardinality signal, drops the degree one.
-        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n, reduce="mean")
+        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n,
+                       reduce=self.back)
         return self.out(torch.cat([back, x], dim=1))
 
 
@@ -197,17 +226,23 @@ class HyperRegionEncoder(nn.Module):
     Both preserve cardinality; only the first also learns what to aggregate.
     """
 
-    AGGS = {"deepsets": DeepSetsHyperConv, "sum": SumHyperConv}
+    # agg name -> (layer class, return-path reduction). The `2` suffix means
+    # SUM on the way back as well, so node degree survives; the plain names keep
+    # the historical mean and are what every earlier result used.
+    AGGS = {"deepsets":  (DeepSetsHyperConv, "mean"),
+            "deepsets2": (DeepSetsHyperConv, "sum"),
+            "sum":       (SumHyperConv, "mean"),
+            "sum2":      (SumHyperConv, "sum")}
 
     def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg="deepsets"):
         super().__init__()
         if agg not in self.AGGS:
             raise ValueError(f"unknown agg {agg!r}; expected one of "
                              f"{sorted(self.AGGS)}")
-        Conv = self.AGGS[agg]
+        Conv, back = self.AGGS[agg]
         self.agg = agg
-        self.c1 = Conv(in_dim, hidden)
-        self.c2 = Conv(hidden, hidden)
+        self.c1 = Conv(in_dim, hidden, back=back)
+        self.c2 = Conv(hidden, hidden, back=back)
         self.proj = nn.Linear(2 * hidden, out_dim)
         self.out_dim = out_dim
 
@@ -386,8 +421,12 @@ class NodeClassifier(nn.Module):
         if self.is_pw:
             self.c1, self.c2 = GCNConv(in_dim, hidden), GCNConv(hidden, hidden)
         else:
-            Conv = HyperRegionEncoder.AGGS[agg]
-            self.c1, self.c2 = Conv(in_dim, hidden), Conv(hidden, hidden)
+            if agg not in HyperRegionEncoder.AGGS:
+                raise ValueError(f"unknown agg {agg!r}; expected one of "
+                                 f"{sorted(HyperRegionEncoder.AGGS)}")
+            Conv, back = HyperRegionEncoder.AGGS[agg]
+            self.c1 = Conv(in_dim, hidden, back=back)
+            self.c2 = Conv(hidden, hidden, back=back)
         self.head = nn.Linear(hidden, n_classes)
 
     def forward(self, x, struct, num_hyperedges=None):
