@@ -73,6 +73,69 @@ class DeepSetsHyperConv(nn.Module):
         back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n, reduce="mean")
         return self.out(torch.cat([back, x], dim=1))
 
+class SumHyperConv(nn.Module):
+    """Minimal sum-pooling hyperedge layer. ONE linear transform.
+
+    This exists because DeepSetsHyperConv conflates two separate claims:
+
+      (a) SUM preserves set-level cardinality that MEAN divides back out.
+      (b) A learned per-member encoding phi, pooled and read by rho, can express
+          richer set functions than any fixed aggregation.
+
+    The project's thesis is (a). But (a) needs only an unnormalised sum, which
+    costs ZERO parameters -- note that GCNConv is already a sum, just with
+    degree normalisation dividing the count out again. So the minimal edit from
+    the pairwise baseline to the hypothesis is REMOVING a normalisation, not
+    adding two MLPs.
+
+    (b) is a much more ambitious claim, and rho(sum phi(x)) -- the Zaheer et al.
+    universal form -- is three stacked transforms. On ~68 training slides with
+    ~30 full-batch gradient steps that is not affordable, and its cost gets
+    charged to (a) in every comparison.
+
+    This layer isolates (a): sum pooling, one transform, parameter count in the
+    same range as GCNConv. Run it against DeepSetsHyperConv on the SAME
+    construction to separate "sum aggregation helps" from "learned set
+    aggregation is unaffordable at this n" -- currently confounded everywhere.
+    """
+
+    def __init__(self, in_dim, out_dim, hidden=None):
+        super().__init__()
+        # signature matches DeepSetsHyperConv so the encoders are interchangeable;
+        # `hidden` is unused -- there is no intermediate representation
+        self.out = nn.Linear(2 * in_dim, out_dim)
+
+    def forward(self, x, hyperedge_index, num_hyperedges=None):
+        node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
+        n = x.size(0)
+        if num_hyperedges is None:
+            num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
+        if num_hyperedges == 0:                       # degenerate region
+            return self.out(torch.cat([torch.zeros_like(x), x], dim=1))
+        # SUM over members, unnormalised -- this is the whole mechanism. A
+        # hyperedge of 12 cells yields twice the magnitude of one with 6, which
+        # is exactly the information mean pooling and clique expansion destroy.
+        he = scatter(x[node_idx], edge_idx, dim=0,
+                     dim_size=num_hyperedges, reduce="sum")
+        # MEAN back to members, so magnitude does not also scale with how many
+        # hyperedges a node happens to belong to (a node-degree effect, not a
+        # set-size one). Keeps the cardinality signal, drops the degree one.
+        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n, reduce="mean")
+        return self.out(torch.cat([back, x], dim=1))
+
+
+def parse_arm(arm):
+    """'hg-knn@sum' -> ('hg-knn', 'sum');  'hg-knn' -> ('hg-knn', 'deepsets').
+
+    The construction half selects which cached graph to read; the aggregation
+    half selects the layer. Encoding both in the arm name means deepsets and sum
+    can run in the SAME sweep on the same folds, so the comparison is paired
+    run-for-run rather than across separate jobs.
+    """
+    construction, _, agg = arm.partition("@")
+    return construction, (agg or "deepsets")
+
+
 # ------------------------------------------------------------ region encoders
 
 # Width of the region vector every arm emits. Both encoders project their
@@ -125,15 +188,26 @@ class PairwiseRegionEncoder(nn.Module):
 
 
 class HyperRegionEncoder(nn.Module):
-    """2-layer Deep Sets hypergraph over all a slide's regions at once.
+    """2-layer hypergraph encoder over all a slide's regions at once.
 
     Emits REGION_DIM like the pairwise encoder, via the same linear adapter.
+
+    agg="deepsets" -> DeepSetsHyperConv, the general rho(sum phi(x)) form
+    agg="sum"      -> SumHyperConv, sum pooling with one transform
+    Both preserve cardinality; only the first also learns what to aggregate.
     """
 
-    def __init__(self, in_dim, hidden, out_dim=REGION_DIM):
+    AGGS = {"deepsets": DeepSetsHyperConv, "sum": SumHyperConv}
+
+    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg="deepsets"):
         super().__init__()
-        self.c1 = DeepSetsHyperConv(in_dim, hidden)
-        self.c2 = DeepSetsHyperConv(hidden, hidden)
+        if agg not in self.AGGS:
+            raise ValueError(f"unknown agg {agg!r}; expected one of "
+                             f"{sorted(self.AGGS)}")
+        Conv = self.AGGS[agg]
+        self.agg = agg
+        self.c1 = Conv(in_dim, hidden)
+        self.c2 = Conv(hidden, hidden)
         self.proj = nn.Linear(2 * hidden, out_dim)
         self.out_dim = out_dim
 
@@ -247,9 +321,11 @@ class MILClassifier(nn.Module):
                  regions_per_batch=16):
         super().__init__()
         self.arm = arm
-        self.is_pw = arm.startswith("pw-")
+        construction, agg = parse_arm(arm)
+        self.construction, self.agg = construction, agg
+        self.is_pw = construction.startswith("pw-")
         self.encoder = (PairwiseRegionEncoder(in_dim, hidden) if self.is_pw
-                        else HyperRegionEncoder(in_dim, hidden))
+                        else HyperRegionEncoder(in_dim, hidden, agg=agg))
         self.pool_kind = pool
         self.rpb = regions_per_batch
         if pool == "attention":

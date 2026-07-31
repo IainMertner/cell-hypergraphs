@@ -82,6 +82,13 @@ FOLDS="${FOLDS:-5}"
 TASK="${TASK:-pattern4}"
 RPB="${RPB:-16}"
 RESULT_TAG="${RESULT_TAG:-}"
+# Arms. Empty = train_patterns.py's DEFAULT_ARMS (pw-knn hg-knn). Passing this
+# is how you get hg-radius or an aggregation variant into a run -- adding an arm
+# to graphs.ARMS is NOT enough, since the default list is separate.
+#     ARMS="pw-knn hg-knn hg-radius"        both constructions
+#     ARMS="pw-knn hg-knn hg-knn@sum"       deepsets vs sum on the SAME graphs
+# arm@agg selects the aggregation layer; the cache is keyed by construction only.
+ARMS="${ARMS:-}"
 
 echo "=== $(date) on $(hostname) ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
@@ -108,6 +115,7 @@ python -u train_patterns.py \
     --patience "$PATIENCE" \
     --folds "$FOLDS" \
     --seed "$SEED" \
+    ${ARMS:+--arms $ARMS} \
     $SUBSAMPLE \
     --save-results "$OUT_DIR/${RESULT_NAME}.json"
 

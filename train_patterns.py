@@ -39,7 +39,7 @@ from scipy import stats
 
 from graphs import N_TYPES, DEFAULT_ARMS
 from models import (set_seed, matched_hidden, n_params, macro_f1,
-                    MILClassifier, AbundanceOnly, pack_bag)
+                    MILClassifier, AbundanceOnly, pack_bag, parse_arm)
 
 # 4-way and the collapsed spatial-only ("arrangement") mapping
 CLASSES4 = ["Brisk Diffuse", "Brisk Band-like", "Non-Brisk Focal", "Non-Brisk Multifocal"]
@@ -439,7 +439,7 @@ def main():
           f"radius_um={cache_params['radius_um']}, "
           f"min_infl={cache_params['min_infl']}")
     for a in args.arms:
-        if a not in cache_params["arms"]:
+        if parse_arm(a)[0] not in cache_params["arms"]:
             raise ValueError(f"arm {a!r} not in graph cache "
                              f"(cached: {cache_params['arms']}); rerun precompute")
 
@@ -463,7 +463,9 @@ def main():
                 f"{f} disagrees with {args.graph_cache}/_params.pt on "
                 f"{sorted(stale)}; the cache mixes parameter settings. "
                 "Rebuild it with precompute_graphs.py against a fresh --out.")
-        missing = [a for a in args.arms if a not in d["bags"]]
+        # arm names may carry an aggregation suffix (hg-knn@sum); the cache is
+        # keyed by CONSTRUCTION only, since aggregation is a model choice
+        missing = [a for a in args.arms if parse_arm(a)[0] not in d["bags"]]
         if missing:
             raise ValueError(f"{f} lacks arm(s) {missing}; rerun "
                              f"precompute_graphs.py --arms {' '.join(missing)}")
@@ -523,22 +525,31 @@ def main():
     class_weight = (freq.sum() / (len(classes) * freq))
     print(f"class weights {[round(w, 2) for w in class_weight.tolist()]}\n")
 
-    in_dim = slide_bags[0][args.arms[0]][0][0].shape[1]
+    in_dim = slide_bags[0][parse_arm(args.arms[0])[0]][0][0].shape[1]
     # Match on the whole model. Since models.REGION_DIM pins the encoder output
     # width, the pool and head are identical across arms and this is equivalent
     # to matching encoders -- but stated on the total, which is the quantity
-    # that actually has to be equal. hg-knn/pw-knn stand in for their families:
-    # every hg-* shares HyperRegionEncoder and every pw-* PairwiseRegionEncoder,
-    # so parameter count depends only on the prefix.
-    def _mil(arm_prefix):
-        return lambda i, h, o: MILClassifier(arm_prefix, i, h, o)
+    # that actually has to be equal.
+    #
+    # Every arm is matched INDIVIDUALLY, not by family. That matters now there
+    # are three encoder shapes with very different costs per hidden unit:
+    # GCNConv is 1 transform, SumHyperConv 1 (but on 2*in_dim), and
+    # DeepSetsHyperConv 3 stacked. Assuming "all hg-* cost the same" would leave
+    # hg-knn@sum badly under-capacity against hg-knn and reintroduce exactly the
+    # confound REGION_DIM was added to remove.
+    def _mil(arm_name):
+        return lambda i, h, o: MILClassifier(arm_name, i, h, o)
+    # reference: the Deep Sets hypergraph at the requested hidden dim
     target = n_params(_mil("hg-knn")(in_dim, args.hidden, n_classes))
-    pw_h = matched_hidden(_mil("pw-knn"), target, in_dim, n_classes)
-    hidden = {a: (pw_h if a.startswith("pw-") else args.hidden) for a in args.arms}
-    pw_total = n_params(_mil("pw-knn")(in_dim, pw_h, n_classes))
-    print(f"capacity: hypergraph model {target:,} params (hidden={args.hidden}) "
-          f"-> pairwise hidden={pw_h} = {pw_total:,} params "
-          f"({pw_total / target:.2f}x target)")
+    hidden = {}
+    for a in args.arms:
+        hidden[a] = (args.hidden if a == "hg-knn"
+                     else matched_hidden(_mil(a), target, in_dim, n_classes))
+    print(f"capacity target {target:,} params (hg-knn @ hidden={args.hidden})")
+    for a in args.arms:
+        tot = n_params(_mil(a)(in_dim, hidden[a], n_classes))
+        print(f"  {a:<16} hidden={hidden[a]:<4} {tot:>7,} params "
+              f"({tot / target:.2f}x target)")
 
     # Report every arm's total, and assert the shared MIL stage really is shared.
     # REGION_DIM makes this true by construction; asserting it means a later
@@ -595,7 +606,8 @@ def main():
             bags = None
         else:
             t_pack = time.time()
-            bags = [pack_bag(sb[arm], arm.startswith("pw-"),
+            construction, _ = parse_arm(arm)
+            bags = [pack_bag(sb[construction], construction.startswith("pw-"),
                              args.regions_per_batch) for sb in slide_bags]
             print(f"  [{arm}] packed {len(bags)} slides in "
                   f"{time.time() - t_pack:.1f}s (once, reused by every run)",
