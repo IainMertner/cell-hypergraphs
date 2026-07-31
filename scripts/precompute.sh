@@ -17,7 +17,7 @@
 #$ -o /home/ucabim3/Scratch/logs/precompute.out
 #$ -e /home/ucabim3/Scratch/logs/precompute.err
 
-ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/segmentation/cellvit_env.sh
+ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/env.sh
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
 source "$ENV_SH"
 mkdir -p /home/ucabim3/Scratch/logs

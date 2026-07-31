@@ -13,7 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool
+from torch_geometric.nn import (GCNConv, GraphConv, global_mean_pool,
+                                global_add_pool)
 from torch_geometric.utils import scatter
 
 # ---------------------------------------------------------------- layer
@@ -91,15 +92,17 @@ class SumHyperConv(nn.Module):
 
 
 def parse_arm(arm):
-    """'hg-knn@sum' -> ('hg-knn', 'sum');  'hg-knn' -> ('hg-knn', 'deepsets').
+    """'hg-knn@sum' -> ('hg-knn', 'sum');  'hg-knn' -> ('hg-knn', None).
 
     The construction half selects which cached graph to read; the aggregation
-    half selects the layer. Encoding both in the arm name means deepsets and sum
-    can run in the SAME sweep on the same folds, so the comparison is paired
-    run-for-run rather than across separate jobs.
+    half selects the layer. Encoding both in the arm name means variants can run
+    in the SAME sweep on the same folds, paired run-for-run.
+
+    None means the arm named no aggregation, and each encoder supplies its own
+    default -- deepsets for hypergraphs, gcn for pairwise.
     """
     construction, _, agg = arm.partition("@")
-    return construction, (agg or "deepsets")
+    return construction, (agg or None)
 
 
 # ------------------------------------------------------------ region encoders
@@ -123,17 +126,35 @@ def _readout(x, batch, n_regions):
 
 
 class PairwiseRegionEncoder(nn.Module):
-    """2-layer GCN over all a slide's regions at once -> (n_regions, REGION_DIM).
+    """2-layer pairwise encoder over all a slide's regions at once.
 
-    `proj` is a plain linear adapter from the 2*hidden readout to the fixed
-    region width -- no nonlinearity, so it changes the interface and not the
-    representational story.
+    Emits REGION_DIM, via the same linear adapter as HyperRegionEncoder.
+
+    agg="gcn" -> GCNConv, degree-normalised by 1/sqrt(d_i d_j). THE DEFAULT,
+                 and what every pairwise result before this used.
+    agg="sum" -> GraphConv (Morris et al.), W1 x_i + W2 sum_j x_j: unnormalised
+                 sum, one transform. This is the pairwise twin of SumHyperConv,
+                 which is also one linear over [aggregate ; self] -- same shape,
+                 same parameter count, so the arms differ only in whether the
+                 neighbourhood is a hyperedge or an adjacency list.
+
+    Without it the aggregation function was confounded with the construction:
+    every pw arm normalised, every hg arm summed, so "hypergraphs win" and "sum
+    beats normalisation" (Xu et al., GIN) were not separable.
     """
 
-    def __init__(self, in_dim, hidden, out_dim=REGION_DIM):
+    AGGS = {"gcn": GCNConv, "sum": GraphConv}
+
+    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None):
         super().__init__()
-        self.c1 = GCNConv(in_dim, hidden)
-        self.c2 = GCNConv(hidden, hidden)
+        agg = agg or "gcn"
+        if agg not in self.AGGS:
+            raise ValueError(f"unknown pairwise agg {agg!r}; expected one of "
+                             f"{sorted(self.AGGS)}")
+        Conv = self.AGGS[agg]
+        self.agg = agg
+        self.c1 = Conv(in_dim, hidden)
+        self.c2 = Conv(hidden, hidden)
         self.proj = nn.Linear(2 * hidden, out_dim)
         self.out_dim = out_dim
 
@@ -160,10 +181,11 @@ class HyperRegionEncoder(nn.Module):
             "sum":       (SumHyperConv, "mean"),
             "sum2":      (SumHyperConv, "sum")}
 
-    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg="deepsets"):
+    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None):
         super().__init__()
+        agg = agg or "deepsets"
         if agg not in self.AGGS:
-            raise ValueError(f"unknown agg {agg!r}; expected one of "
+            raise ValueError(f"unknown hypergraph agg {agg!r}; expected one of "
                              f"{sorted(self.AGGS)}")
         Conv, back = self.AGGS[agg]
         self.agg = agg
@@ -270,7 +292,8 @@ class MILClassifier(nn.Module):
         construction, agg = parse_arm(arm)
         self.construction, self.agg = construction, agg
         self.is_pw = construction.startswith("pw-")
-        self.encoder = (PairwiseRegionEncoder(in_dim, hidden) if self.is_pw
+        self.encoder = (PairwiseRegionEncoder(in_dim, hidden, agg=agg)
+                        if self.is_pw
                         else HyperRegionEncoder(in_dim, hidden, agg=agg))
         self.pool_kind = pool
         self.rpb = regions_per_batch
@@ -321,11 +344,17 @@ class NodeClassifier(nn.Module):
         construction, agg = parse_arm(arm)
         self.is_pw = construction.startswith("pw-")
         if self.is_pw:
-            self.c1, self.c2 = GCNConv(in_dim, hidden), GCNConv(hidden, hidden)
+            agg = agg or "gcn"
+            if agg not in PairwiseRegionEncoder.AGGS:
+                raise ValueError(f"unknown pairwise agg {agg!r}; expected one "
+                                 f"of {sorted(PairwiseRegionEncoder.AGGS)}")
+            Conv = PairwiseRegionEncoder.AGGS[agg]
+            self.c1, self.c2 = Conv(in_dim, hidden), Conv(hidden, hidden)
         else:
+            agg = agg or "deepsets"
             if agg not in HyperRegionEncoder.AGGS:
-                raise ValueError(f"unknown agg {agg!r}; expected one of "
-                                 f"{sorted(HyperRegionEncoder.AGGS)}")
+                raise ValueError(f"unknown hypergraph agg {agg!r}; expected one "
+                                 f"of {sorted(HyperRegionEncoder.AGGS)}")
             Conv, back = HyperRegionEncoder.AGGS[agg]
             self.c1 = Conv(in_dim, hidden, back=back)
             self.c2 = Conv(hidden, hidden, back=back)

@@ -32,7 +32,7 @@ CHUNK_SIZE="${CHUNK_SIZE:-1}"   # raise h_rt to match if you raise this
 # SGE runs a SPOOLED copy of this file, so $0 cannot locate siblings -- absolute
 # paths required.
 REPO=/home/ucabim3/Scratch/cell-hypergraphs
-ENV_SH="$REPO/segmentation/cellvit_env.sh"
+ENV_SH="$REPO/env.sh"
 CACHE_PY="$REPO/segmentation/cache_cells.py"
 
 # Fail fast: without these a missing env is not fatal, and the job burns its GPU
