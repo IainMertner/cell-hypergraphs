@@ -24,11 +24,14 @@ mkdir -p /home/ucabim3/Scratch/logs
 
 echo "=== $(date) on $(hostname) ==="
 ARMS="${ARMS:-}"
-echo "arms: ${ARMS:-<default>}"
+LIMIT="${LIMIT:-}"                 # first N slides only, for a measurement run
+OUT="${OUT:-/home/ucabim3/Scratch/graph_cache}"
+echo "arms: ${ARMS:-<default>} | limit: ${LIMIT:-none} | out: $OUT"
 
 python -u precompute_graphs.py \
     --cache-root /home/ucabim3/Scratch/cellvit_out \
-    --out /home/ucabim3/Scratch/graph_cache \
-    ${ARMS:+--arms $ARMS}
+    --out "$OUT" \
+    ${ARMS:+--arms $ARMS} \
+    ${LIMIT:+--limit $LIMIT}
 
 echo "=== done: $(date) ==="

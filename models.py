@@ -287,7 +287,10 @@ def pack_hyper(region_graphs):
     xs, his, batch = [], [], []
     node_off, edge_off = 0, 0
     dev = region_graphs[0][0].device
-    for r, (x, hi) in enumerate(region_graphs):
+    # multi-family arms cache a third slot (per-hyperedge family tag); it is
+    # carried but not yet consumed, so unpack by index rather than by arity
+    for r, g in enumerate(region_graphs):
+        x, hi = g[0], g[1]
         xs.append(x)
         if hi.numel():
             h = hi.clone()

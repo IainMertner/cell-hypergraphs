@@ -33,7 +33,8 @@ from graphs import (build, load_cache, regions as find_regions, N_TYPES,
 # is reconciled separately. feature_version counts because the cache stores
 # finished feature tensors, so an encoding change invalidates just as hard.
 GEOMETRY_KEYS = ("tile_px", "min_cells", "min_infl", "feature_version",
-                 "k", "radius_um", "hg_radius_um")
+                 "k", "radius_um", "hg_radius_um", "max_size",
+                 "window_um", "semantic_min_size", "semantic_stride")
 
 
 def slide_id(path):
@@ -72,7 +73,15 @@ def build_one_slide(cache_path, arms, tile_px, min_cells, min_infl):
         for a in arms:
             d = build(a, c, t, mpp, morph=m)
             struct = d.edge_index if a.startswith("pw-") else d.hyperedge_index
-            bags[a].append((d.x.clone(), struct.clone()))
+            # multi-family arms carry a per-hyperedge family tag, stored as a
+            # third slot. Without it the cache cannot distinguish a 6-cell
+            # spatial hyperedge from a 200-cell semantic one and family-aware
+            # aggregation is impossible. Single-family arms stay 2-tuples, so
+            # existing caches and unpack sites are unaffected.
+            fam = getattr(d, "family_id", None)
+            bags[a].append((d.x.clone(), struct.clone())
+                           if fam is None
+                           else (d.x.clone(), struct.clone(), fam.clone()))
     if kept == 0:
         return None
 
@@ -92,13 +101,20 @@ def main():
     ap.add_argument("--tile-px", type=int, default=4000)
     ap.add_argument("--min-cells", type=int, default=2000)
     ap.add_argument("--min-infl", type=int, default=50)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="build only the first N slides (0 = all). For a quick "
+                         "measurement run before committing to a full precompute "
+                         "-- note it writes a real cache whose _params.pt then "
+                         "describes a partial slide set")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     params = dict(arms=list(args.arms), tile_px=args.tile_px,
                   min_cells=args.min_cells, min_infl=args.min_infl,
                   feature_version=FEATURE_VERSION,
-                  **{k: PARAMS[k] for k in ("k", "radius_um", "hg_radius_um")})
+                  **{k: PARAMS[k] for k in
+                     ("k", "radius_um", "hg_radius_um", "max_size",
+                      "window_um", "semantic_min_size", "semantic_stride")})
     params_path = os.path.join(args.out, "_params.pt")
 
     # check the manifest before building anything -- topping up across a
@@ -122,6 +138,9 @@ def main():
     print(f"params: {params}\n")
 
     caches = sorted(glob.glob(os.path.join(args.cache_root, "*", "cells_cache.npz")))
+    if args.limit:
+        caches = caches[:args.limit]
+        print(f"LIMIT {args.limit}: measurement run, not a full cache\n")
     print(f"{len(caches)} segmented slides found\n")
 
     done, topped, skipped, empty = 0, 0, 0, 0
