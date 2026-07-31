@@ -1,9 +1,8 @@
 #!/bin/bash
-# Build a flat list of slide paths, one per line, for the array job to index.
-# gdc-client nests each .svs in its own UUID directory, so we just collect paths
-# rather than moving/symlinking files around.
+# Flat list of slide paths for the segmentation array job to index -- gdc-client
+# nests each .svs in its own UUID dir, so collect paths rather than move files.
 #
-# Run on the login node (it's instant):   bash make_slide_list.sh
+#     bash segmentation/make_slide_list.sh
 
 SLIDES=/home/ucabim3/Scratch/tcga_brca_slides
 OUT=/home/ucabim3/Scratch/slide_list.txt
@@ -17,4 +16,4 @@ echo "first 3:"
 head -3 "$OUT"
 echo
 echo "submit the array with:"
-echo "    qsub -t 1-$N /home/ucabim3/cellvit_array.sh"
+echo "    qsub -t 1-$N segmentation/cellvit_chunked.sh"

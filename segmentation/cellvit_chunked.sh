@@ -1,37 +1,19 @@
 #!/bin/bash -l
-# =============================================================================
-# CellViT++ inference. ONE SLIDE PER ARRAY TASK.
+# CellViT++ inference, one slide per array task.
 #
-# This used to batch slides into chunks, on the theory that fewer, larger tasks
-# meant fewer queue waits. That was wrong: SGE schedules array tasks
-# INDEPENDENTLY, so 160 tasks queue once, not 160 times -- while the longer
-# walltime a chunk needs makes every one of them harder to place. An 8h/20-slide
-# chunk sat queued ~14h with 1 of 15 tasks placed; a 3h GPU job for the same
-# work fared little better. Short jobs backfill into gaps long ones cannot reach.
+# SGE schedules array tasks independently, so 160 tasks queue once, not 160
+# times -- batching them only made the walltime longer and placement harder.
 #
-# One slide (~15 min) against a 1.5h wall is a small, easy-to-place request:
-#   - tasks start as GPUs free, so you see steady progress, not all-or-nothing
-#   - a failure or overrun costs ONE slide, not a whole chunk
-#   - no walltime is wasted by a chunk that finishes early
-#
-# Set CHUNK_SIZE above 1 to restore batching, but raise h_rt with it.
-#
-# Safe to resubmit: the skip-if-done check means completed slides cost seconds.
-# Better still, point SLIDE_LIST at only the unsegmented slides, so no task
-# spends a queue wait just to print "already done":
-#
+# Point SLIDE_LIST at unsegmented slides only:
 #     find ~/Scratch/tcga_brca_slides -name '*.svs' | sort | while read w; do
 #       id=$(basename "$w" .svs | cut -d. -f1)
 #       [ -f ~/Scratch/cellvit_out/$id/cells_cache.npz ] || echo "$w"
 #     done > ~/Scratch/slide_list.txt
 #
-# SUBMIT -- one task per slide:
 #     N=$(wc -l < ~/Scratch/slide_list.txt)
 #     qsub -t 1-$N segmentation/cellvit_chunked.sh
 #
-# Add -tc to cap how many run at once if you want to leave GPUs for other jobs:
-#     qsub -t 1-$N -tc 8 segmentation/cellvit_chunked.sh
-# =============================================================================
+# Safe to resubmit: completed slides are skipped in seconds.
 
 #$ -N cellvit
 #$ -l h_rt=1:30:0
@@ -41,25 +23,20 @@
 #$ -o /home/ucabim3/Scratch/logs/chunk.$TASK_ID.out
 #$ -e /home/ucabim3/Scratch/logs/chunk.$TASK_ID.err
 
-set -uo pipefail          # NOT -e: one bad slide must not kill the whole chunk
+set -uo pipefail          # NOT -e: one bad slide must not kill the chunk
 
 SLIDE_LIST=/home/ucabim3/Scratch/slide_list.txt
 OUTROOT=/home/ucabim3/Scratch/cellvit_out
-# One slide per task. h_rt=1:30:0 gives ~6x the ~15min average, enough for the
-# largest slides. If you raise this, raise h_rt to match or tasks die mid-slide.
-CHUNK_SIZE="${CHUNK_SIZE:-1}"
+CHUNK_SIZE="${CHUNK_SIZE:-1}"   # raise h_rt to match if you raise this
 
-# Everything comes from the repo, not from copies in $HOME. SGE runs a SPOOLED
-# copy of this file (/var/opt/sge/.../job_scripts/<jobid>), so $0 cannot be used
-# to locate siblings -- the path has to be absolute.
+# SGE runs a SPOOLED copy of this file, so $0 cannot locate siblings -- absolute
+# paths required.
 REPO=/home/ucabim3/Scratch/cell-hypergraphs
 ENV_SH="$REPO/segmentation/cellvit_env.sh"
 CACHE_PY="$REPO/segmentation/cache_cells.py"
 
-# FAIL FAST. Without these checks a missing env is not fatal: the script carries
-# on, prints "cellvit-inference: command not found" once per slide, exits 0, and
-# throws away a multi-hour GPU allocation having segmented nothing. Jobs 36789
-# and 38663 both did exactly that after ~14h queue waits.
+# Fail fast: without these a missing env is not fatal, and the job burns its GPU
+# allocation printing "command not found" once per slide before exiting 0.
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
 source "$ENV_SH"
 command -v cellvit-inference >/dev/null 2>&1 || {
@@ -85,8 +62,7 @@ for i in $(seq "$START" "$END"); do
     SLIDE_ID=$(basename "$WSI" .svs | cut -d. -f1)
     OUTDIR="$OUTROOT/$SLIDE_ID"
 
-    # completion is marked by the CACHE file: the output dir is created before
-    # processing starts, so its existence proves nothing
+    # keyed on the CACHE file: the output dir is created before processing starts
     if [ -f "$OUTDIR/cells_cache.npz" ]; then
         echo "[$i] $SLIDE_ID -- already done, skipping"
         SKIPPED=$((SKIPPED + 1))

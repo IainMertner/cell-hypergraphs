@@ -1,10 +1,6 @@
 """Loading CellViT output and carving slides into regions.
 
-Not a graph construction -- this is the data layer everything else sits on.
-
-Reads only the compact .npz written by segmentation/cache_cells.py. Parsing raw
-cells.json directly used to live here too, but nothing needs it any more: the
-cluster pipeline caches once and every downstream stage reads the cache.
+Reads the compact .npz written by segmentation/cache_cells.py.
 """
 
 import numpy as np
@@ -13,15 +9,9 @@ import numpy as np
 def zscore_morph(morph):
     """Per-slide z-score of the morphology block.
 
-    MUST be applied on every path that feeds morphology to a model. Raw
-    poly_features are in slide pixels -- area runs to hundreds or thousands of
-    px^2, perimeter to tens -- while the one-hot type columns they are
-    concatenated with are 0/1. Left raw, those two columns dominate the first
-    linear layer of every arm and the type signal is swamped.
-
-    Per-slide (not global) because mpp and staining vary between slides, and
-    every graph is built within one slide, so a slide-local scale is the
-    comparable one.
+    Required on every path feeding morphology to a model: raw areas run to
+    hundreds of px^2 against 0/1 one-hot type columns, and would dominate the
+    first linear layer. Per-slide because mpp and staining vary between slides.
     """
     morph = np.asarray(morph, dtype=np.float64)
     mu, sd = morph.mean(0), morph.std(0)
@@ -30,13 +20,8 @@ def zscore_morph(morph):
 
 
 def load_cache(path):
-    """Load the compact .npz written by cache_cells.py (cluster pipeline).
-
-    cache_cells.py stores morphology RAW -- area in px^2 runs to the hundreds
-    while the one-hot type columns it is concatenated with are 0/1 -- so it is
-    z-scored here. Without this the morphology columns dominate the first linear
-    layer of every arm and the type signal is swamped.
-    """
+    """Load the compact .npz written by cache_cells.py. Morphology is stored
+    raw there, so it is z-scored on the way out."""
     d = np.load(path)
     return (d["centroids"].astype(np.float64), d["types"].astype(np.int64),
             float(d["mpp"]), zscore_morph(d["morph"]))

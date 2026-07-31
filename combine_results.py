@@ -1,25 +1,13 @@
-"""
-combine_results.py
-------------------
-Merge the per-seed JSON files written by `train_patterns.py --save-results` and
-produce the same report a single unsplit run would have produced.
+"""Merge the per-seed JSONs from `train_patterns.py --save-results` into the
+report a single unsplit run would have produced.
 
-WHY SPLITTING IS SAFE. _make_folds is a deterministic function of
-(cohort, n_folds, seed), and the cohort is built from sorted(glob(...)), so seed
-1 computed in its own array task is bit-identical to seed 1 computed inline.
-Arms are evaluated over the same ordered run list within a part, so scores stay
-paired index-for-index, and concatenating parts preserves that pairing.
+Splitting is safe because folds are deterministic in (cohort, n_folds, seed) and
+arms are evaluated over the same ordered run list, so concatenating parts keeps
+scores paired index-for-index. What would break that is checked here: a changed
+cohort (segmentation landing mid-sweep), a changed task/folds/epochs/arms, or a
+repeated seed, which would double-count runs and shrink the variance.
 
-WHAT WOULD MAKE IT UNSAFE, and is therefore checked here:
-  - different cohorts. If a segmentation job lands between array tasks, the
-    slide set changes, every fold changes, and merging splices two different
-    experiments. The cohort fingerprint catches this.
-  - different task/classes/folds/epochs/arms. Same reasoning.
-  - a repeated seed, which would double-count runs and shrink the variance.
-
-Usage:
     python combine_results.py ~/Scratch/results/
-    python combine_results.py ~/Scratch/results/ --glob 'patterns_seed*.json'
 """
 
 import argparse
@@ -118,14 +106,11 @@ def main():
         print(f"  {'':<18} vs abundance {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
 
-    print("\nabundance-only is the bar: an arm shows spatial signal only if it")
-    print("clears it. Majority baseline is the floor.")
-    print("READING THE NUMBERS:")
-    print("  - macroF1 near floor with respectable acc = collapsed to majority.")
-    print("  - the +- is a spread, NOT a standard error: repeated-CV runs share")
-    print("    training data. Use the corrected p, which accounts for that")
-    print("    overlap (Nadeau & Bengio); a plain t-test here would overstate.")
-    print("  - at this n, treat p as indicative and read it with the win rate.")
+    print("\nabundance-only is the bar; the majority baseline is the floor.")
+    print("  - macroF1 near floor with respectable acc = collapsed to majority")
+    print("  - the +- is a spread, not a standard error: repeated-CV runs share")
+    print("    training data, which is what the corrected p accounts for")
+    print("  - at this n, read p together with the win rate")
 
 
 if __name__ == "__main__":

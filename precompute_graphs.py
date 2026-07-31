@@ -1,34 +1,20 @@
-"""
-precompute_graphs.py
---------------------
-STAGE 1 of the split pipeline: build every arm's region graphs for every slide,
-once, and save them to disk. Training (stage 2, train_patterns.py) then loads
-these instead of rebuilding -- turning every future run from hours into minutes.
+"""STAGE 1: build every arm's region graphs for every slide, once.
 
-The graphs are deterministic functions of the segmentation output and the
-construction parameters (k, radii, thresholds). None of that changes between
-experiments, so this is computed once and reused across tasks, seeds, arms, and
-capacity regimes.
+The graphs are deterministic in the segmentation output and the construction
+parameters, so training (stage 2) loads these instead of rebuilding.
 
-CACHE INVALIDATION: if you change a construction parameter -- k, radius_um,
-min_cells, min_infl, tile_px, or the feature encoding -- caches are STALE. The
-parameters used are written into each cache file and checked against the current
-ones on every rerun; a mismatch ABORTS rather than silently mixing graphs built
-under different settings into one cache. Delete the cache dir (or pass a fresh
---out) to rebuild.
+Changing a construction parameter makes the cache stale. Each file records the
+parameters it was built under and a mismatch aborts, rather than mixing settings
+into one cache -- delete the dir or pass a fresh --out.
 
-ADDING ARMS: rerunning with an arm the cache lacks tops up existing slides with
-just that arm rather than skipping them, so you never have to rebuild the whole
-cache to add one construction. _params.pt is written at the END of a run and
-records only the arms present in EVERY cached slide, so an interrupted run
-leaves the manifest conservative rather than overstating what is on disk.
+Rerunning with a new arm tops up existing slides with just that arm. _params.pt
+is written last and lists only arms present in EVERY slide, so an interrupted
+run understates the cache rather than promising arms that are not there.
 
-Output: one .pt file per slide in <out>/, each containing every arm's list of
-region graphs, the slide abundance vector, and the parameters used.
+Output: one .pt per slide holding each arm's region graphs, the slide abundance
+vector, and the parameters used.
 
-Usage:
-    python precompute_graphs.py --cache-root cellvit_out --out graph_cache
-    python precompute_graphs.py --arms pw-knn hg-knn hg-radius   # subset
+    qsub scripts/precompute.sh
 """
 
 import argparse
@@ -42,13 +28,10 @@ from graphs import (build, load_cache, regions as find_regions, N_TYPES,
                     DEFAULT_ARMS, PARAMS, FEATURE_VERSION)
 
 
-# parameters that change the GRAPHS themselves. Two caches agreeing on these are
-# interchangeable; disagreeing on any one of them means the graphs are not
-# comparable and must not share a cache dir. `arms` is deliberately NOT here --
-# arm coverage varies per slide and is reconciled separately.
-# feature_version is here for the same reason: the cache stores finished feature
-# tensors, so an encoding change is just as invalidating as a geometry change,
-# and unlike geometry it cannot be spotted by eye from the stored parameters.
+# Parameters that change the graphs themselves; disagreeing on any one means two
+# caches must not be mixed. `arms` is excluded -- coverage varies per slide and
+# is reconciled separately. feature_version counts because the cache stores
+# finished feature tensors, so an encoding change invalidates just as hard.
 GEOMETRY_KEYS = ("tile_px", "min_cells", "min_infl", "feature_version",
                  "k", "radius_um", "hg_radius_um")
 
@@ -58,17 +41,12 @@ def slide_id(path):
 
 
 def geometry_mismatch(old, new):
-    """(changed, added) -- keys where a cached param set disagrees, and keys the
-    cache predates entirely.
+    """(changed, added) -- keys the cached params disagree on, and keys it
+    predates entirely.
 
-    CHANGED is fatal: the cached graphs were built under a different setting and
-    are not comparable with new ones.
-
-    ADDED is not. A key absent from the cached params means the cache was built
-    before that parameter existed -- so nothing in it used any value for it, and
-    topping up is consistent. This is what lets a new construction (hg-radius,
-    which introduced hg_radius_um) be added to an existing cache without forcing
-    a full rebuild of every slide. Reported, not silent.
+    Changed is fatal. Added is not: nothing in the cache used a value for a key
+    that did not exist yet, so topping up stays consistent -- this is what lets
+    a new construction be added without rebuilding every slide.
     """
     changed, added = {}, {}
     for k in GEOMETRY_KEYS:
@@ -82,7 +60,7 @@ def geometry_mismatch(old, new):
 def build_one_slide(cache_path, arms, tile_px, min_cells, min_infl):
     """Build every arm's region graphs for one slide. Returns a dict or None."""
     centroids, types, mpp, morph = load_cache(cache_path)
-    regs = find_regions(centroids, tile_px, min_cells)     # no cap; validity filter below
+    regs = find_regions(centroids, tile_px, min_cells)
 
     bags = {a: [] for a in arms}
     kept = 0
@@ -94,7 +72,6 @@ def build_one_slide(cache_path, arms, tile_px, min_cells, min_infl):
         for a in arms:
             d = build(a, c, t, mpp, morph=m)
             struct = d.edge_index if a.startswith("pw-") else d.hyperedge_index
-            # store only what training needs: features + topology
             bags[a].append((d.x.clone(), struct.clone()))
     if kept == 0:
         return None
@@ -118,16 +95,14 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    # parameters that define cache validity -- stored and checked on every rerun
     params = dict(arms=list(args.arms), tile_px=args.tile_px,
                   min_cells=args.min_cells, min_infl=args.min_infl,
                   feature_version=FEATURE_VERSION,
                   **{k: PARAMS[k] for k in ("k", "radius_um", "hg_radius_um")})
     params_path = os.path.join(args.out, "_params.pt")
 
-    # Check the manifest BEFORE building anything: a geometry change means the
-    # cached graphs and the ones we are about to build are not comparable, and
-    # topping up would silently mix them. Abort with the offending keys named.
+    # check the manifest before building anything -- topping up across a
+    # geometry change would silently mix incomparable graphs
     if os.path.exists(params_path):
         changed, added = geometry_mismatch(torch.load(params_path), params)
         if changed:
@@ -158,8 +133,7 @@ def main():
         existing = torch.load(out_path) if os.path.exists(out_path) else None
 
         if existing is not None:
-            # per-file check too: the manifest can be absent or lag behind if an
-            # earlier run was interrupted, but every slide file carries its own
+            # per-file too: the manifest can lag an interrupted run
             changed, _ = geometry_mismatch(existing.get("params", {}), params)
             if changed:
                 lines = "\n".join(f"    {k}: cached {o!r} -> requested {n!r}"
@@ -175,9 +149,8 @@ def main():
                 continue
 
         t = time.time()
-        # build only what is absent; regions are a deterministic function of the
-        # geometry params (checked identical above), so topped-up arms line up
-        # index-for-index with the bags already stored
+        # build only what is absent; regions are deterministic in the geometry
+        # params, so topped-up arms line up index-for-index with the stored bags
         build_arms = missing if existing is not None else list(args.arms)
         result = build_one_slide(path, build_arms, args.tile_px,
                                  args.min_cells, args.min_infl)
@@ -201,9 +174,7 @@ def main():
         print(f"[{i+1}/{len(caches)}] {sid}: {note}, "
               f"{time.time()-t:.1f}s", flush=True)
 
-    # Written LAST, and only for arms every cached slide actually has -- an
-    # interrupted run then leaves a manifest that understates the cache rather
-    # than one that promises arms training would KeyError on.
+    # written last, and only for arms every slide has
     if arms_everywhere:
         torch.save(dict(params, arms=sorted(arms_everywhere)), params_path)
 

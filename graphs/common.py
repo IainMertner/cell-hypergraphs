@@ -4,9 +4,8 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-# PanNuke taxonomy (CellViT): type indices are 1..5, in order
-#   1 Neoplastic  2 Inflammatory  3 Connective  4 Dead  5 Epithelial
-# Index 2 matters most here -- it is the lymphocyte/TIL class the labels concern.
+# PanNuke (CellViT) types are 1..5: Neoplastic, Inflammatory, Connective, Dead,
+# Epithelial. Index 2 is the lymphocyte/TIL class.
 N_TYPES = 5
 
 
@@ -18,10 +17,9 @@ def microns_to_px(um, mpp):
 def node_features(types, morph=None):
     """(N, 5) one-hot type, optionally concatenated with (N, 5) morphology.
 
-    types must be in 1..5. This is checked rather than assumed: the one-hot is
-    written at column `type - 1`, so a type-0 cell (CellViT emits 0 for
-    unclassified in some configs) would land at column -1 and be silently
-    encoded as Epithelial. A wrong label that never raises is the worst kind.
+    Types must be in 1..5. Checked, because the one-hot is written at column
+    `type - 1`, so a type-0 cell would land at column -1 and be silently encoded
+    as Epithelial.
     """
     n = len(types)
     bad = np.unique(types[(types < 1) | (types > N_TYPES)])
@@ -88,13 +86,11 @@ def incidences_from_groups(groups, n_nodes):
 
 
 def structural_stats(name, data, n_nodes):
-    """Deterministic structural statistics (pre-reg 8.2). No seeds, no training.
+    """Deterministic structural statistics. No seeds, no training.
 
-    Works for both pairwise (edge_index) and hypergraph (hyperedge_index) Data.
-    'clique_edges' is the number of undirected pairwise edges needed to encode
-    the same grouping; 'expansion' is that cost relative to the hypergraph's
-    incidence count -- the measured version of "how badly does clique expansion
-    blow up for this construction".
+    Works for pairwise (edge_index) and hypergraph (hyperedge_index) Data.
+    'clique_edges' is how many undirected edges would be needed to encode the
+    same grouping; 'expansion' is that relative to the incidence count.
     """
     if hasattr(data, "hyperedge_index") and data.hyperedge_index.numel():
         hi = data.hyperedge_index

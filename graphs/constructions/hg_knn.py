@@ -1,14 +1,8 @@
-"""hg-knn: k-nearest-neighbour hypergraph. The primary construction.
+"""hg-knn: one hyperedge per cell containing {cell + its k nearest}.
 
-Direct higher-order analogue of pw_knn: for each cell, ONE hyperedge containing
-{cell + its k nearest neighbours within the cap}. N cells -> N hyperedges, which
-overlap heavily (a cell belongs to its own hyperedge plus every neighbour's that
-reaches it).
-
-Cardinality is fixed at k+1 (fewer only where the distance cap bites), which is
-what makes this the clean comparator to pw_knn: same k, same neighbour set, the
-only difference being set-vs-pairs. A variable-cardinality variant lived in
-hg_radius.py and is in git history if that becomes the question.
+The direct higher-order analogue of pw_knn -- same k, same neighbours, grouped
+rather than paired. Cardinality is FIXED at k+1 (fewer only where the distance
+cap bites), so sum and mean aggregation differ here only by a constant.
 """
 
 import numpy as np

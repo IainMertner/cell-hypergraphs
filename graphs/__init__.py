@@ -3,44 +3,17 @@
     from graphs import build, ARMS
     data = build("hg-knn", centroids, types, mpp, morph=morph)
 
-Both builders return a PyG Data with the same node set and node features; only
-the topology differs. The pairwise arm carries `edge_index`, the hypergraph arm
+Every builder returns a PyG Data with the same node set and node features; only
+the topology differs. Pairwise arms carry `edge_index`, hypergraph arms
 `hyperedge_index` + `num_hyperedges`.
 
-Arms
-----
-pw-knn      BASELINE, field-standard k-NN cell graph. Cardinality 2.
-pw-radius   CONTROL for hg-radius: pairwise edges within the SAME radius, so
-            the neighbourhood is the same cells in pairwise form. Without it,
-            hg-radius vs pw-knn confounds hypergraph-vs-pairwise with
-            radius-vs-kNN.
-hg-knn      PRIMARY, {cell + its k nearest} as one hyperedge -- the direct
-            higher-order analogue: same k, same neighbours, grouped not paired.
-            Cardinality FIXED at k+1 = 6.
-hg-radius   MECHANISM TEST, all cells within r as one hyperedge. Cardinality
-            VARIES (median 6, max 15) at the same median as hg-knn.
+    pw-knn      baseline, field-standard k-NN graph
+    pw-radius   control for hg-radius: same neighbourhood, pairwise form
+    hg-knn      {cell + k nearest} as one hyperedge. Cardinality FIXED at k+1
+    hg-radius   all cells within r. Cardinality VARIES with density
 
-pw-knn vs hg-knn holds k and the neighbour set fixed, so the only difference is
-set-vs-pairs. But note what it CANNOT test: hg-knn's cardinality is constant, so
-the sum-vs-mean mechanism -- sum preserves set-level counts that mean divides
-back out -- has no set-size variation to act on. A null there does not falsify
-the mechanism; it may just mean the construction cannot express it.
-
-hg-radius is the arm where cardinality varies, so it is where a mechanistic
-advantage should appear. Comparing hg-knn against hg-radius isolates cardinality
-VARIANCE from cardinality SCALE, since 12.5um is chosen to match hg-knn's median.
-
-Four further constructions (pw-delaunay, pw-clique, hg-delaunay, hg-radius,
-hg-knn+semantic) were removed once it was clear they only serve a follow-up
-question -- whether an advantage tracks clique-expansibility -- which is
-meaningless until some arm clears the abundance control. They are recoverable
-from git history (`git show ed1da7a:graphs/constructions/hg_radius.py`).
-
-For the record, measured expansion ratios before removal (TCGA-E2-A14P, three
-densest 4000px regions): pw-* 1.0x, hg-delaunay 1.0x, hg-knn 2.5x, hg-radius
-3.1-3.8x, hg-knn+semantic 5.6-9.3x. Note that spectrum is compressed at the
-bottom -- three of six arms sat within 1.0-2.5x -- so it supported far less of a
-trend argument than the design assumed. Worth knowing before reinstating them.
+Removed constructions (pw-delaunay, pw-clique, hg-delaunay, hg-knn+semantic)
+are in git history at ed1da7a.
 """
 
 from . import cells, common
@@ -51,29 +24,17 @@ from .cells import load_cache, regions, region_mask, grid_tiles, zscore_morph
 
 ARMS = ["pw-knn", "pw-radius", "hg-knn", "hg-radius"]
 
-# What runs unless you ask otherwise. Kept distinct from ARMS so reinstating a
-# construction does not silently enlarge the default experiment.
-#
-# hg-radius is DELIBERATELY not a default. It exists to answer one question:
-# hg-knn has FIXED cardinality k+1, so the sum-vs-mean mechanism this project
-# rests on has no set-size variation to act on there. hg-radius varies (median 6,
-# max 15), so it is where a mechanistic advantage should appear if it exists.
-# Run it explicitly:  --arms pw-knn hg-knn hg-radius
+# Kept distinct from ARMS so adding a construction does not silently enlarge the
+# default experiment. Request others explicitly with --arms.
 DEFAULT_ARMS = ["pw-knn", "hg-knn"]
 
-# default construction parameters, in microns where applicable.
-# hg_radius_um=12.5 puts hg-radius at the same MEDIAN cardinality as hg-knn (6),
-# so the two differ in cardinality VARIANCE rather than in scale -- which is the
-# comparison that isolates the mechanism.
+# Microns where applicable. hg_radius_um=12.5 matches hg-knn's median
+# cardinality, so the two differ in cardinality VARIANCE, not scale.
 PARAMS = dict(k=5, radius_um=35.0, hg_radius_um=12.5, max_size=None)
 
-# Bump whenever the NODE FEATURE encoding changes in a way that invalidates an
-# existing graph cache. precompute_graphs.py stores finished feature tensors,
-# not raw cells, so a feature-encoding change CANNOT be repaired at load time --
-# the cache has to be rebuilt. Recording the version makes that detectable
-# instead of silent, which the geometry parameters alone would not catch.
-#   1 -> morphology concatenated RAW to the one-hot type columns
-#   2 -> morphology z-scored per slide (graphs.cells.zscore_morph)
+# Bump when the node feature encoding changes. The cache stores finished feature
+# tensors, so such a change cannot be repaired at load time -- it must be rebuilt.
+#   1 -> morphology concatenated RAW    2 -> morphology z-scored per slide
 FEATURE_VERSION = 2
 
 
@@ -95,14 +56,10 @@ def build(arm, centroids, types, mpp, morph=None, params=None):
     if arm == "hg-knn":
         return hg_knn.build(centroids, types, p["k"], cap, morph)
     if arm == "pw-radius":
-        # SAME radius as hg-radius, so the neighbourhoods contain the same
-        # cells and only the representation differs. This is the control that
-        # separates "hypergraph structure" from "radius neighbourhood".
+        # same radius as hg-radius, so only the representation differs
         return pw_radius.build(centroids, types,
                                microns_to_px(p["hg_radius_um"], mpp), morph)
     if arm == "hg-radius":
-        # its OWN radius, not the 35um cap -- see hg_radius.py for the measured
-        # cardinalities at 10 / 12.5 / 35um and why 12.5 is the setting
         return hg_radius.build(centroids, types,
                                microns_to_px(p["hg_radius_um"], mpp),
                                morph, p["max_size"])

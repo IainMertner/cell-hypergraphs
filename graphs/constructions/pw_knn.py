@@ -1,14 +1,8 @@
 """pw-knn: k-nearest-neighbour cell graph. The field-standard baseline.
 
-Each cell connects to its k nearest neighbours within a distance cap, then the
-graph is symmetrised (an edge exists if EITHER endpoint had the other in its
-k-nearest set), so node degree can slightly exceed k.
-
-Note this construction is NOT invariant to node ordering: ties in the k-nearest
-set are broken by array position, so the same tissue can yield non-isomorphic
-graphs. hg_knn shares that property, so it is not a difference BETWEEN the arms
--- but it does put a floor on how reproducible either is. An order-invariant
-Delaunay alternative lived in pw_delaunay.py and is in git history.
+Symmetrised, so an edge exists if EITHER endpoint had the other in its
+k-nearest set and degree can exceed k. Not invariant to node ordering: ties are
+broken by array position.
 """
 
 import numpy as np

@@ -1,30 +1,12 @@
-"""
-models.py
----------
-Everything learnable: the hypergraph layer, the MIL classifier built on it, and
-capacity matching.
+"""Everything learnable: hypergraph layers, the MIL classifier, capacity matching.
 
-Kept separate from graph construction (graphs/) and from the task harness
-(train_patterns.py) because all three vary independently -- you swap
-constructions without touching models, and swap tasks without touching either.
-
-The chain, for a slide:
+For a slide:
 
     region graph --[encoder]--> nodes --[readout]--> region vector
     {region vectors} --[attention pool]--> slide vector --[head]--> class
 
-DeepSetsHyperConv is the mechanism the project turns on: its SUM pooling is what
-a clique expansion cannot reproduce. Both region encoders are built on it or on
-GCNConv, and everything downstream of the encoder is shared across arms, so the
-arm is the only thing that varies.
-
-REMOVED (recoverable via `git show ed1da7a:models.py`): the node-level
-classifiers PairwiseGNN / HyperGNN / DeepSetsHyperGNN and helpers model_for /
-struct_of / make_targets / train_eval, whose only caller was the masked-cell-type
-task. Note HyperGNN was the MEAN-aggregation control -- the comparison that
-distinguishes "hypergraph topology adds nothing" from "sum-vs-mean is the wrong
-lever" -- and no equivalent exists in the MIL pipeline. If a null needs
-explaining, that is the thing to bring back.
+Everything downstream of the encoder is shared across arms, so the arm is the
+only thing that varies.
 """
 
 import numpy as np
@@ -39,23 +21,14 @@ from torch_geometric.utils import scatter
 class DeepSetsHyperConv(nn.Module):
     """Set-aggregation hyperedge layer: node -> hyperedge -> node.
 
-    The difference from HypergraphConv is that pooling is a SUM, not a mean.
-    Sum preserves set-level counts and composition that a clique expansion
-    cannot reconstruct; mean divides that information back out and collapses
-    toward clique-equivalent behaviour. That is the whole mechanism.
+    rho(sum phi(x)), the Zaheer et al. universal form for permutation-invariant
+    set functions. Pooling members is a SUM, preserving set cardinality that a
+    mean divides out. log(set size) is fed to rho explicitly.
 
-    Stages: phi (per-member MLP) -> sum-pool (+ log set size, so the model can
-    account for cardinality rather than be destabilised by it) -> rho (MLP on
-    the set summary) -> scatter back to members -> combine with own features.
-
-    RETURN PATH: `back` is "mean" (historical default) or "sum". Mean averages
-    over the hyperedges containing a node and so DISCARDS node degree -- how
-    many neighbourhoods a cell participates in, which is a density signal.
-    GCNConv retains node degree through its 1/sqrt(d_i d_j) term, so with
-    back="mean" the hypergraph arms compete without something the pairwise
-    baseline has. Note this docstring argues above that mean "divides that
-    information back out", then did exactly that on the return path. Exposed as
-    a variant so it is measured rather than assumed.
+    `back` controls the RETURN path: "mean" averages over the hyperedges
+    containing a node and discards node degree; "sum" keeps it. GCNConv retains
+    degree via 1/sqrt(d_i d_j), so back="mean" costs the hypergraph arms a
+    density signal the pairwise baseline has.
     """
 
     def __init__(self, in_dim, out_dim, hidden=None, back="mean"):
@@ -85,54 +58,20 @@ class DeepSetsHyperConv(nn.Module):
         return self.out(torch.cat([back, x], dim=1))
 
 class SumHyperConv(nn.Module):
-    """Minimal sum-pooling hyperedge layer. ONE linear transform.
+    """Sum-pooling hyperedge layer with ONE linear transform.
 
-    This exists because DeepSetsHyperConv conflates two separate claims:
+    DeepSetsHyperConv conflates two claims: that sum preserves cardinality, and
+    that a learned per-member encoding expresses richer set functions. Only the
+    first is the thesis, and it costs no parameters -- so this isolates it at a
+    cost comparable to GCNConv. Run against DeepSetsHyperConv on the same
+    construction to separate the two.
 
-      (a) SUM preserves set-level cardinality that MEAN divides back out.
-      (b) A learned per-member encoding phi, pooled and read by rho, can express
-          richer set functions than any fixed aggregation.
-
-    The project's thesis is (a). But (a) needs only an unnormalised sum, which
-    costs ZERO parameters -- note that GCNConv is already a sum, just with
-    degree normalisation dividing the count out again. So the minimal edit from
-    the pairwise baseline to the hypothesis is REMOVING a normalisation, not
-    adding two MLPs.
-
-    (b) is a much more ambitious claim, and rho(sum phi(x)) -- the Zaheer et al.
-    universal form -- is three stacked transforms. On ~68 training slides with
-    ~30 full-batch gradient steps that is not affordable, and its cost gets
-    charged to (a) in every comparison.
-
-    This layer isolates (a): sum pooling, one transform, parameter count in the
-    same range as GCNConv. Run it against DeepSetsHyperConv on the SAME
-    construction to separate "sum aggregation helps" from "learned set
-    aggregation is unaffordable at this n" -- currently confounded everywhere.
-
-    THE RETURN PATH IS A SEPARATE CHOICE, and `back` controls it:
-
-      back="mean"  average over the hyperedges containing a node. Magnitude does
-                   not scale with node degree -- but node degree is DISCARDED,
-                   and node degree is a density signal: how many neighbourhoods
-                   a cell participates in.
-      back="sum"   sum over them. Node degree survives into the representation.
-
-    This matters more than it looks. GCNConv keeps node degree via its
-    1/sqrt(d_i d_j) normalisation, and pw_knn symmetrises its edges so degree
-    genuinely varies. With back="mean" the hypergraph arms compete WITHOUT a
-    density signal the pairwise baseline has -- and on a topology-only task
-    (--features none) that is most of the available signal.
-
-    back="mean" was inherited from DeepSetsHyperConv, whose docstring argues
-    that mean "divides that information back out" while doing exactly that four
-    lines later. Both are exposed as variants so the choice is measured rather
-    than assumed.
+    `back` as in DeepSetsHyperConv.
     """
 
     def __init__(self, in_dim, out_dim, hidden=None, back="mean"):
         super().__init__()
-        # signature matches DeepSetsHyperConv so the encoders are interchangeable;
-        # `hidden` is unused -- there is no intermediate representation
+        # `hidden` unused; signature matches DeepSetsHyperConv
         self.back = back
         self.out = nn.Linear(2 * in_dim, out_dim)
 
@@ -143,9 +82,7 @@ class SumHyperConv(nn.Module):
             num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
         if num_hyperedges == 0:                       # degenerate region
             return self.out(torch.cat([torch.zeros_like(x), x], dim=1))
-        # SUM over members, unnormalised -- this is the whole mechanism. A
-        # hyperedge of 12 cells yields twice the magnitude of one with 6, which
-        # is exactly the information mean pooling and clique expansion destroy.
+        # unnormalised: a hyperedge of 12 yields twice the magnitude of one of 6
         he = scatter(x[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
         back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n,
@@ -167,19 +104,9 @@ def parse_arm(arm):
 
 # ------------------------------------------------------------ region encoders
 
-# Width of the region vector every arm emits. Both encoders project their
-# readout down to this before the MIL stage, so AttentionMIL and the head are
-# byte-for-byte the same size regardless of arm or hidden dim.
-#
-# This exists to make a capacity confound STRUCTURALLY IMPOSSIBLE rather than
-# tuned away. Previously out_dim was 2*hidden, so widening the pairwise encoder
-# to match the hypergraph encoder's parameter count also widened the pool and
-# head -- matching the encoders was what CREATED the downstream mismatch (pool
-# 20,161 vs 8,385, head 628 vs 260, total 1.77x). Retuning `hidden` to equalise
-# totals would fix the number but not the mechanism: any later change to
-# att_dim, n_classes, or the readout would silently reintroduce the drift.
-# Pinning the interface means the only thing capacity matching has to equalise
-# is the encoders themselves.
+# Fixed width every encoder emits, so AttentionMIL and the head are identical
+# across arms and capacity matching only has to equalise the encoders. When
+# out_dim was 2*hidden, widening an encoder widened the pool with it.
 REGION_DIM = 64
 
 
@@ -226,9 +153,8 @@ class HyperRegionEncoder(nn.Module):
     Both preserve cardinality; only the first also learns what to aggregate.
     """
 
-    # agg name -> (layer class, return-path reduction). The `2` suffix means
-    # SUM on the way back as well, so node degree survives; the plain names keep
-    # the historical mean and are what every earlier result used.
+    # name -> (layer, return-path reduction). `2` means sum on the way back too,
+    # so node degree survives; plain names keep the mean earlier results used.
     AGGS = {"deepsets":  (DeepSetsHyperConv, "mean"),
             "deepsets2": (DeepSetsHyperConv, "sum"),
             "sum":       (SumHyperConv, "mean"),
@@ -254,12 +180,9 @@ class HyperRegionEncoder(nn.Module):
 
 # ------------------------------------------------------------ packing a slide
 #
-# DEVICE: every tensor created here must be built on the same device as the
-# incoming features. The `batch` vector and the empty-hyperedge fallback are
-# constructed from scratch rather than derived from x, so they default to CPU
-# unless told otherwise -- and a CPU index against CUDA features fails inside
-# scatter, not here, which makes it read like a PyG bug. CPU-only runs never
-# expose it because everything agrees by accident.
+# Tensors built here (batch vector, empty-hyperedge fallback) must be created on
+# x's device -- they default to CPU, and a CPU index against CUDA features fails
+# inside scatter, which reads like a PyG bug.
 
 def pack_pairwise(region_graphs):
     """Combine a slide's pairwise regions into one disconnected graph.
@@ -300,16 +223,11 @@ def pack_hyper(region_graphs):
 
 
 def pack_bag(region_graphs, is_pw, regions_per_batch=16):
-    """Pack one slide's regions into memory-bounded groups, ONCE.
+    """Pack one slide's regions into memory-bounded groups, once.
 
-    Call this per slide before training and reuse the result for every epoch and
-    every run. Packing is a deterministic function of the region graphs, so doing
-    it inside forward() re-runs the same torch.cat over many small tensors on
-    every train, val and test pass -- tens of thousands of times across a sweep,
-    for an identical answer.
-
-    Region boundaries are never split, so grouping does not change any region
-    vector; this is purely about not repeating work.
+    Deterministic in the region graphs, so call it per slide before training and
+    reuse the result rather than repeating the torch.cat on every pass. Region
+    boundaries are never split, so grouping changes no region vector.
     """
     packer = pack_pairwise if is_pw else pack_hyper
     return [packer(region_graphs[i:i + regions_per_batch])
@@ -336,20 +254,13 @@ class AttentionMIL(nn.Module):
 class MILClassifier(nn.Module):
     """Region encoder (minibatched) + attention pool + linear head. One per arm.
 
-    The pool and head are sized from encoder.out_dim, which REGION_DIM pins to a
-    constant, so they are identical across arms and the ONLY thing that differs
-    in parameter count is the encoder -- exactly what capacity matching targets.
-    train_patterns.py asserts this at startup so it cannot regress unnoticed.
+    Pool and head are sized from encoder.out_dim, which REGION_DIM pins, so the
+    encoder is the only thing that differs in parameter count across arms.
+    train_patterns.py asserts this at startup.
 
-    Regions are encoded in GROUPS of `regions_per_batch` rather than all at once.
-    Full-slide batching put every region's nodes on the GPU simultaneously, which
-    OOMs on large slides with high-cardinality hypergraph constructions. Grouping
-    caps peak memory at group-size while keeping most of the batching speedup.
-
-    Region boundaries are never split (whole regions per group), so per-region
-    vectors are identical to full-batch or per-region encoding. The group vectors
-    are concatenated WITHOUT detaching, so gradients flow through every group and
-    training is unchanged.
+    Regions are encoded in groups of `regions_per_batch`: full-slide batching
+    OOMs on large slides with high-cardinality hypergraphs. Whole regions per
+    group and no detaching, so region vectors and gradients are unchanged.
     """
 
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
@@ -380,12 +291,9 @@ class MILClassifier(nn.Module):
         return torch.cat(vecs, dim=0)          # attached: gradients flow through all groups
 
     def forward(self, bag):
-        """bag: either raw [(x, struct), ...] regions, or pre-packed groups from
-        pack_bag(). Prefer pre-packed -- packing is a deterministic function of
-        the region graphs, so doing it here repeats identical torch.cat work on
-        every epoch for train, val AND test. Hoisting it out of the loop is a
-        pure speedup with no effect on the result.
-        """
+        """bag: raw [(x, struct), ...] regions, or pre-packed groups from
+        pack_bag(). Prefer pre-packed -- packing here repeats identical work on
+        every epoch."""
         packed = (pack_bag(bag, self.is_pw, self.rpb)
                   if bag and len(bag[0]) == 2 else bag)
         region_vecs = self._encode_regions(packed)
@@ -399,19 +307,13 @@ class MILClassifier(nn.Module):
 class NodeClassifier(nn.Module):
     """2 conv layers + linear head, per-NODE output. No pooling, no MIL.
 
-    For the masked-cell-type task, which is the cleanest diagnostic available
-    for the encoders themselves:
+    For the masked-cell-type task: supervision is per cell, so one region gives
+    thousands of labels, and nothing downstream of the encoder is involved. An
+    arm that underperforms here is losing in its encoder; arms that tie here but
+    differ on the slide task differ in the MIL stage.
 
-      - supervision is PER CELL, so a single region gives thousands of labels
-        instead of the one label a whole slide gives. Sample size stops being
-        the binding constraint.
-      - nothing downstream of the encoder is involved. No attention pooling, no
-        bag aggregation. If an arm underperforms here it is the encoder, and if
-        arms tie here but differ on the slide task, the difference lives in the
-        MIL stage instead.
-
-    Shares its conv layers with the MIL encoders, so `arm` accepts the same
-    names including the @agg suffix (hg-knn@sum, hg-radius@deepsets, ...).
+    Same conv layers as the MIL encoders, so `arm` takes the same names
+    including the @agg suffix.
     """
 
     def __init__(self, arm, in_dim, hidden, n_classes):
@@ -463,10 +365,9 @@ def n_params(model):
 def matched_hidden(cls, target, in_dim, out_dim, lo=4, hi=4096, step=2):
     """Smallest hidden dim whose parameter count is closest to `target`.
 
-    Used to widen the pairwise baselines until they match the Deep Sets arms, so
-    a win cannot be attributed to simply having more parameters. In a pilot the
-    Deep Sets model had ~4.9x the parameters of the GCN at equal hidden size,
-    and an apparent advantage vanished once that was equalised.
+    Widens the pairwise baselines to match the Deep Sets arms, so a win cannot
+    be attributed to parameter count. At equal hidden size the Deep Sets model
+    had ~4.9x the GCN's parameters, and a pilot advantage vanished once matched.
     """
     best, best_err = lo, float("inf")
     for h in range(lo, hi, step):

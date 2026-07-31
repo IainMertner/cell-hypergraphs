@@ -1,55 +1,24 @@
-"""
-train_masked.py
----------------
-DIAGNOSTIC: masked cell-type prediction, per NODE.
+"""DIAGNOSTIC: masked cell-type prediction, per node.
 
-30% of cells in a region have their features zeroed; the model predicts their
-PanNuke type from the surrounding cells and the topology.
+30% of a region's cells have their features zeroed; the model predicts their
+PanNuke type from the surrounding cells and the topology. Supervision is per
+cell and nothing downstream of the encoder runs, so this isolates the encoders
+from both the sample size and the MIL stage.
 
-WHY THIS IS THE USEFUL DIAGNOSTIC RIGHT NOW. Every slide-level result is limited
-by 122 labels and swamped by variance, and it cannot separate three explanations:
-the encoder, the MIL pooling, or the sample size. This task removes two of them:
+--features decides whether the task is circular:
 
-  - supervision is PER CELL. One region gives thousands of labels, so sample
-    size is not the constraint.
-  - nothing downstream of the encoder runs. No bag aggregation, no attention
-    pooling. Whatever differs between arms here is the encoder.
+  type   5-d one-hot type only. The label is in the input for every unmasked
+         cell, so the task reduces to reading a neighbourhood type histogram --
+         which flatters sum aggregation trivially.
+  morph  5-d morphology only (area, perimeter, circularity, eccentricity,
+         extent). The label is nowhere in the input. THE DEFAULT.
+  both   all 10 dims. As circular as `type`.
+  none   constant features; see select_features.
 
-So: if hg-* beats or matches pw-knn here but loses on the slide task, the
-problem is the MIL stage. If it loses HERE too, the hypergraph representation
-genuinely carries less usable signal than the pairwise one at this scale.
+The topology is never a leak -- every construction is built from centroids.
 
---features CONTROLS WHETHER THE TASK IS CIRCULAR, and this is the whole design.
+Reads the graph cache, so no re-precompute.
 
-  type   node features are the 5-d one-hot type ONLY. The label is then in the
-         input for every unmasked cell, so predicting a masked cell's type is
-         essentially reading a neighbourhood type histogram. That measures
-         whether the graph propagates local composition -- and it flatters SUM
-         aggregation for a trivial reason, since counting neighbour types is
-         precisely what sum does. Informative about propagation, near-useless
-         as evidence about representing tissue.
-
-  morph  node features are the 5-d morphology ONLY (area, perimeter,
-         circularity, eccentricity, extent). The label appears NOWHERE in the
-         input, so the model must infer "this is a lymphocyte" from the SHAPES
-         of surrounding cells. Non-circular, genuinely hard, and the version to
-         believe. THIS IS THE DEFAULT.
-
-  both   all 10 dims. Same circularity as `type`, plus morphology.
-
-Note the topology is never a leak: pw-knn, hg-knn and hg-radius are built from
-centroids alone and never see cell type.
-
-CAVEAT. Under `type`/`both`, cell type is partly readable straight off the
-neighbours -- tissue is locally homogeneous -- so both arms may hit a ceiling
-and fail to discriminate. A tie there is weak evidence; a clear difference is
-strong. Read the margin over the majority-class floor, not the raw score.
-
-Reads the graph cache, so no re-precompute -- the node features already carry
-the type as their leading one-hot block, which is both the input to mask and
-the label to predict.
-
-Usage (SUBMIT, do not run on a login node):
     qsub scripts/run_masked.sh
 """
 
@@ -67,21 +36,14 @@ from models import set_seed, matched_hidden, n_params, macro_f1, NodeClassifier,
 
 
 def select_features(x, features):
-    """Slice cached node features. The LABEL is always taken from the one-hot
-    block BEFORE this, so `morph` and `none` genuinely remove it from the input.
+    """Slice cached node features. The label is read from the one-hot block
+    before this, so `morph` and `none` genuinely remove it from the input.
 
-    `none` replaces every node feature with a constant 1, leaving TOPOLOGY as
-    the only signal. That makes it the sharpest test of sum-vs-mean available:
-
-      SumHyperConv      sum_{j in e} 1  ==  |e|, the hyperedge CARDINALITY
-      DeepSetsHyperConv same, and it already feeds log1p(size) explicitly
-      GCNConv           sum_j 1/sqrt(d_i d_j), a degree term
-
-    So with constant features the sum layers reduce to reading set size, and a
-    concrete prediction follows: hg-knn should sit AT THE FLOOR, because its
-    cardinality is fixed at k+1 and therefore constant and uninformative, while
-    hg-radius (median 6, max 15) still encodes local density. If that holds it
-    confirms the fixed-cardinality argument rather than leaving it inferred.
+    `none` sets every feature to a constant 1, leaving topology as the only
+    signal: sum pooling then reduces to sum_{j in e} 1 == |e|, the hyperedge
+    cardinality. So hg-knn should sit at the floor (its cardinality is fixed at
+    k+1) while hg-radius (6-15) still encodes local density -- which tests the
+    fixed-cardinality argument directly.
     """
     if features == "none":
         return torch.ones(x.shape[0], 1, dtype=x.dtype)
@@ -93,12 +55,8 @@ def select_features(x, features):
 
 
 def load_regions(graph_cache, arms, max_regions, min_cells, features, seed=0):
-    """Pull the same regions for every arm, so the comparison is paired.
-
-    Region i of arm A and region i of arm B are the same cells with different
-    topology -- that is the whole point, and it only holds if the selection is
-    identical across arms.
-    """
+    """Pull the same regions for every arm, so region i is the same cells under
+    different topology and the comparison is paired."""
     files = [f for f in sorted(glob.glob(os.path.join(graph_cache, "*.pt")))
              if not f.endswith("_params.pt")]
     rng = np.random.default_rng(seed)
@@ -114,8 +72,7 @@ def load_regions(graph_cache, arms, max_regions, min_cells, features, seed=0):
             x = bags[ref][r][0]
             if x.shape[0] < min_cells:
                 continue
-            # label from the one-hot block FIRST, then slice the inputs -- so
-            # --features morph removes the label from the input entirely
+            # label first, then slice, so --features morph really drops it
             y = x[:, :N_TYPES].argmax(1)
             x = select_features(x, features)
             structs = {}
@@ -154,8 +111,7 @@ def train_eval_region(model, x, struct, n_he, y, tr, va, te, is_pw,
         model.eval()
         with torch.no_grad():
             pred = fwd().argmax(1)
-            # select on macro-F1, not accuracy: cell types are heavily
-            # imbalanced (neoplastic dominates), so accuracy rewards collapse
+            # macro-F1 not accuracy: cell types are heavily imbalanced
             f1 = macro_f1(pred[va].cpu().numpy(), y[va].cpu().numpy(), N_TYPES)
             if f1 > best_val:
                 best_val, since = f1, 0
@@ -183,10 +139,8 @@ def main():
     ap.add_argument("--mask-frac", type=float, default=0.30)
     ap.add_argument("--features", choices=["none", "type", "morph", "both"],
                     default="morph",
-                    help="morph (default) keeps the label OUT of the input, so "
-                         "the task is not circular. type/both put the one-hot "
-                         "label in the features and reduce the task to reading "
-                         "a neighbourhood type histogram")
+                    help="morph keeps the label out of the input; type/both "
+                         "put it in and make the task circular")
     ap.add_argument("--hidden", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--patience", type=int, default=30)
@@ -233,17 +187,16 @@ def main():
               f"{n_params(_node(a)(in_dim, hidden[a], N_TYPES)):>7,} params")
 
     scores = {a: [] for a in args.arms}
-    # Track BOTH baselines across every region, not just the first. Majority
-    # accuracy matters as much as the macro-F1 floor: with inverse-frequency
-    # weights the model spreads predictions across classes, which RAISES
-    # macro-F1 and LOWERS accuracy -- so an arm can look respectable on accuracy
-    # while being worse than always answering the dominant class.
+    # Both baselines, over every region. With inverse-frequency weights the
+    # model spreads predictions across classes, raising macro-F1 and lowering
+    # accuracy -- so an arm can beat the floor and still lose to "always answer
+    # the dominant class".
     floors, majs, presents = [], [], []
     for ri, (x, structs, y) in enumerate(regions):
         n = x.shape[0]
         counts = np.bincount(y.numpy(), minlength=N_TYPES)
         maj = counts.max() / n
-        # macro-F1 a single-class predictor would score, over classes PRESENT
+        # macro-F1 of a single-class predictor, over classes present
         present = int((counts > 0).sum())
         f_floor = (2 * maj / (maj + 1)) / present
         floors.append(f_floor)
@@ -256,15 +209,9 @@ def main():
         for s in range(args.seeds):
             set_seed(s)
             rng = np.random.default_rng(s)
-            # features=none masks nothing, so restricting to a 30% subset would
-            # just discard 70% of the labels for no reason -- every node is
-            # equally "predict this from structure". Use them all: the test set
-            # goes from 6% of nodes (20% of a 30% subset) to 20%.
-            #
-            # The other modes still need masking. Under type/both the label is
-            # literally in the node's own features; under morph its own shape is
-            # a strong cue, and hiding it is what forces the prediction to come
-            # from CONTEXT rather than from the cell itself.
+            # features=none masks nothing, so every node is usable and the test
+            # set is 20% rather than 6%. The other modes must mask: the node's
+            # own features carry the label (type/both) or a strong cue (morph).
             frac = 1.0 if args.features == "none" else args.mask_frac
             targets = rng.permutation(n)[:int(n * frac)]
             n_tr, n_va = int(len(targets) * 0.6), int(len(targets) * 0.2)
@@ -274,12 +221,9 @@ def main():
             xm = x.clone()
             if args.features != "none":
                 xm[torch.from_numpy(targets).long()] = 0.0  # hide the targets
-            # features=none: nothing to hide, and zeroing WOULD do harm. With
-            # 0/1 inputs, sum-pooling reads the count of UNMASKED members --
-            # Binomial(|e|, 0.7) -- so cardinality arrives with ~27% noise, and
-            # hg-knn (constant |e|=6) picks up spurious variation that is pure
-            # noise. Left at 1, `he` is exactly |e|, so "hg-knn has no
-            # cardinality signal" is a clean prediction rather than a muddy one.
+            # zeroing under features=none would actively harm: sum-pooling
+            # would read the count of UNMASKED members, Binomial(|e|, 0.7), so
+            # even constant-cardinality hg-knn would pick up noise
 
             for a in args.arms:
                 set_seed(s)
@@ -309,11 +253,9 @@ def main():
         print(f"  {a:<20} acc {acc:.3f} +- {v[:, 0].std():.3f} "
               f"| macroF1 {f1:.3f} +- {v[:, 1].std():.3f}"
               + ("  [acc BELOW majority]" if acc < maj_acc else ""))
-    print("\nPer-CELL supervision, so thousands of labels per region -- sample")
-    print("size is not the constraint here, and no MIL or attention pooling is")
-    print("involved. A difference between arms is the ENCODER. A tie is weak")
-    print("evidence: cell type is partly readable from neighbours, so both arms")
-    print("may simply be at ceiling.")
+    print("\nPer-cell supervision and no MIL stage, so a difference between arms")
+    print("is the ENCODER. A tie is weak evidence -- cell type is partly readable")
+    print("off the neighbours, so both arms may be at ceiling.")
 
 
 if __name__ == "__main__":

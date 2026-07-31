@@ -1,21 +1,10 @@
-"""
-stats_table.py
---------------
-Structural statistics per arm, straight off the precomputed graph cache.
+"""Structural statistics per arm, straight off the precomputed graph cache.
 
-Deterministic: no seeds, no training, no models. Reports hyperedge cardinality
-and the clique-expansion ratio -- the measured version of "how badly does clique
-expansion blow up for this construction". That spectrum is the mechanistic claim
-the hypergraph arms rest on, so it is worth being able to re-measure cheaply and
-across the whole cohort rather than from one slide.
+No seeds, no training, no models. Reports hyperedge cardinality and the
+clique-expansion ratio -- the measured version of the mechanistic claim the
+hypergraph arms rest on, over the whole cohort rather than one slide.
 
-(This table used to be reachable only through the masked-cell-type script, which
-has since been removed; that route also required re-parsing raw cells.json per
-slide. Reading the cache instead makes a whole-cohort measurement cheap.)
-
-Usage:
     python stats_table.py --graph-cache graph_cache
-    python stats_table.py --graph-cache graph_cache --slides 20
 """
 
 import argparse
@@ -54,7 +43,6 @@ def main():
     if args.slides:
         files = files[:args.slides]
 
-    # accumulate every region of every slide, per arm
     acc = {a: [] for a in arms}
     for f in files:
         bags = torch.load(f)["bags"]
@@ -68,7 +56,6 @@ def main():
         print("nothing to report -- empty cache?")
         return
 
-    # mean across regions, plus the expansion range (the figure that matters)
     rows = []
     for a in arms:
         r = acc[a]
@@ -88,9 +75,9 @@ def main():
     for a in arms:
         e = np.array([s["expansion"] for s in acc[a]])
         print(f"  {a:<18} {e.min():5.1f}x - {e.max():5.1f}x   (mean {e.mean():5.1f}x)")
-    print("\nA hypergraph advantage is mechanistic only if it TRACKS this "
-          "ordering.\nRead the spread, not just the mean -- an arm whose ratio "
-          "swings widely\nacross regions is not a stable point on the spectrum.")
+    print("\nA hypergraph advantage is mechanistic only if it tracks this "
+          "ordering.\nRead the spread too: an arm whose ratio swings widely "
+          "across regions is\nnot a stable point on the spectrum.")
 
 
 if __name__ == "__main__":

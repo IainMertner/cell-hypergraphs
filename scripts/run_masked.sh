@@ -1,27 +1,14 @@
 #!/bin/bash -l
-# =============================================================================
-# DIAGNOSTIC: masked cell-type prediction (train_masked.py).
+# Masked cell-type prediction (train_masked.py). Per-cell supervision, no MIL --
+# measures the encoders only.
 #
-# *** NEVER run train_masked.py directly on a login node. *** ALWAYS qsub.
+# NEVER run train_masked.py on a login node. Always qsub.
 #
-# Per-CELL supervision, so a handful of regions gives thousands of labels --
-# unlike the slide-level task, sample size is not the constraint. No MIL, no
-# attention pooling: this measures the ENCODERS and nothing else.
-#
-# SUBMIT:
 #     qsub scripts/run_masked.sh
-#     qsub -v ARMS="pw-knn hg-radius hg-radius@sum",REGIONS=20 scripts/run_masked.sh
-# =============================================================================
+#     qsub -v FEATURES=none,ARMS="pw-knn hg-radius@sum2",REGIONS=20 scripts/run_masked.sh
 
 #$ -N masked
-# 10 min, not hours. A 5-arm x 10-region x 3-seed run measured ~30s on an A100:
-# each training run is a 2-layer GNN over a few thousand nodes, so an epoch is
-# milliseconds. Walltime is the main thing hurting GPU placement on this
-# cluster, so ask for what the job needs plus headroom, not a round number.
-#
-# Cost scales with ARMS x REGIONS x SEEDS. If you push those up an order of
-# magnitude, raise this with -l h_rt=... on the submit line rather than editing.
-#$ -l h_rt=0:10:0
+#$ -l h_rt=0:20:0
 #$ -l mem=32G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
@@ -42,10 +29,7 @@ ARMS="${ARMS:-pw-knn hg-knn hg-radius}"
 REGIONS="${REGIONS:-10}"
 SEEDS="${SEEDS:-3}"
 EPOCHS="${EPOCHS:-300}"
-# morph = label NOT in the input (non-circular, the one to believe).
-# type/both put the one-hot label in the features, reducing the task to reading
-# a neighbourhood type histogram -- which favours sum aggregation for free.
-FEATURES="${FEATURES:-morph}"   # none|type|morph|both
+FEATURES="${FEATURES:-morph}"      # none | type | morph | both
 
 echo "arms=$ARMS regions=$REGIONS seeds=$SEEDS epochs=$EPOCHS features=$FEATURES"
 
