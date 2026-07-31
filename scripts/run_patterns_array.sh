@@ -56,6 +56,8 @@ FOLDS="${FOLDS:-5}"
 TASK="${TASK:-pattern4}"
 RPB="${RPB:-16}"
 RESULT_TAG="${RESULT_TAG:-}"
+BLEND="${BLEND:-}"                # set to 1 for the family-blending ablation
+STAR_LAYERS="${STAR_LAYERS:-}"     # @star depth; 4 matches a 2-layer hypergraph arm
 # empty = train_patterns.py's DEFAULT_ARMS. arm@agg picks the aggregation layer;
 # the cache is keyed by construction only.
 #     ARMS="pw-knn hg-knn hg-radius"        ARMS="pw-knn hg-knn hg-knn@sum"
@@ -83,6 +85,8 @@ python -u train_patterns.py \
     --folds "$FOLDS" \
     --seed "$SEED" \
     ${ARMS:+--arms $ARMS} \
+    ${BLEND:+--blend-families} \
+    ${STAR_LAYERS:+--star-layers $STAR_LAYERS} \
     $SUBSAMPLE \
     --save-results "$OUT_DIR/${RESULT_NAME}.json"
 

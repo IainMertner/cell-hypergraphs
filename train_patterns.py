@@ -24,7 +24,8 @@ from scipy import stats
 
 from graphs import N_TYPES, DEFAULT_ARMS
 from models import (set_seed, matched_hidden, n_params, macro_f1,
-                    MILClassifier, AbundanceOnly, pack_bag, parse_arm)
+                    MILClassifier, AbundanceOnly, pack_bag, parse_arm,
+                    pack_mode)
 
 # 4-way and the collapsed spatial-only ("arrangement") mapping
 CLASSES4 = ["Brisk Diffuse", "Brisk Band-like", "Non-Brisk Focal", "Non-Brisk Multifocal"]
@@ -345,6 +346,17 @@ def main():
     ap.add_argument("--save-results", default=None,
                     help="write per-run scores + cohort fingerprint to this "
                          "JSON path, for combine_results.py")
+    ap.add_argument("--star-layers", type=int, default=4,
+                    help="depth of @star arms. 4 reach-matches a 2-layer "
+                         "hypergraph arm (one hypergraph layer = two star hops) "
+                         "and is a DELIBERATE choice favouring the baseline; 2 "
+                         "matches layer count instead. Sweep and report the "
+                         "depth at which star catches up")
+    ap.add_argument("--blend-families", action="store_true",
+                    help="ABLATION: pool both hyperedge families into one "
+                         "vector instead of keeping them separable. Shows what "
+                         "the +semantic arm does if a 200-cell semantic "
+                         "hyperedge and a 5-cell spatial one are treated alike")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     ap.add_argument("--regions-per-batch", type=int, default=16,
@@ -438,7 +450,9 @@ def main():
     # transform, SumHyperConv one (on 2*in_dim), DeepSetsHyperConv three, so
     # "all hg-* cost the same" would leave hg-knn@sum badly under-capacity.
     def _mil(arm_name):
-        return lambda i, h, o: MILClassifier(arm_name, i, h, o)
+        return lambda i, h, o: MILClassifier(arm_name, i, h, o,
+                                            blend_families=args.blend_families,
+                                            star_layers=args.star_layers)
     # reference: the Deep Sets hypergraph at the requested hidden dim
     target = n_params(_mil("hg-knn")(in_dim, args.hidden, n_classes))
     hidden = {}
@@ -453,7 +467,9 @@ def main():
 
     # REGION_DIM makes the pool+head identical by construction; assert it so a
     # later change to att_dim or the readout cannot silently undo that
-    built_models = {a: MILClassifier(a, in_dim, hidden[a], n_classes)
+    built_models = {a: MILClassifier(a, in_dim, hidden[a], n_classes,
+                                     blend_families=args.blend_families,
+                                     star_layers=args.star_layers)
                     for a in args.arms}
     shared = {a: n_params(m) - n_params(m.encoder) for a, m in built_models.items()}
     if len(set(shared.values())) != 1:
@@ -467,6 +483,14 @@ def main():
           f"arms | total spread {max(totals.values()) / min(totals.values()):.3f}x")
     print("  (abundance-only is a different model class by design -- it is the "
           "triviality control, not a capacity-matched arm)")
+    if any(parse_arm(a)[1] == "star" for a in args.arms):
+        note = ("reach-matched to a 2-layer hypergraph arm; favours the baseline"
+                if args.star_layers >= 4 else
+                "layer-matched, so the hypergraph arm holds ~2x the reach")
+        print(f"  star arms at depth {args.star_layers} -- {note}. One "
+              f"hypergraph layer is two\n  star hops, so this is an active "
+              f"choice, not a default. Sweep --star-layers to\n  report the "
+              f"depth at which star catches up.")
 
     # Repeated k-fold: each seed resamples the patient->fold assignment, since at
     # this n which patients land in test dominates the variance. The assignment is
@@ -495,7 +519,10 @@ def main():
         else:
             t_pack = time.time()
             construction, _ = parse_arm(arm)
-            bags = [pack_bag(sb[construction], construction.startswith("pw-"),
+            # pack by ARM, not construction: a star arm reads the hypergraph
+            # cache but needs the bipartite packer, so the construction half of
+            # the name does not determine the encoding
+            bags = [pack_bag(sb[construction], pack_mode(arm),
                              args.regions_per_batch) for sb in slide_bags]
             print(f"  [{arm}] packed {len(bags)} slides in "
                   f"{time.time() - t_pack:.1f}s (once, reused by every run)",
@@ -517,7 +544,9 @@ def main():
                                    select_on=args.select_on)
             else:
                 m = MILClassifier(arm, in_dim, hidden[arm], n_classes,
-                                  regions_per_batch=args.regions_per_batch)
+                                  regions_per_batch=args.regions_per_batch,
+                                  blend_families=args.blend_families,
+                                  star_layers=args.star_layers)
                 r = train_eval_mil(m, bags, y, tr, va, te, n_classes, args.epochs,
                                    0.01, s, device=args.device,
                                    class_weight=class_weight,
@@ -588,6 +617,10 @@ def main():
                 "seeds": seed_list,
                 "folds": args.folds,
                 "epochs": args.epochs,
+                # recorded because it is a design decision, not a nuisance
+                # parameter: it sets how much reach the star baseline gets
+                "star_layers": args.star_layers,
+                "blend_families": bool(args.blend_families),
                 "arms": list(args.arms),
                 "n_test_mean": n_te,
                 "n_train_mean": n_tr,

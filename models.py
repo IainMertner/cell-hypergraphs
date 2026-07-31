@@ -21,6 +21,40 @@ from torch_geometric.utils import scatter
 
 # ---------------------------------------------------------------- layer
 
+def _back_by_family(he, node_idx, edge_idx, n, reduce, family_id, n_families):
+    """Return path, split by hyperedge family. -> (n, n_families * he_dim).
+
+    Scattering both families into ONE vector is destructive, not merely badly
+    scaled: `back_i` is the sum of spatial and semantic contributions before any
+    weight touches it, so no downstream linear can recover either. With the
+    semantic family running ~4x the magnitude of the spatial one (measured), the
+    combined arm would be semantic hyperedges plus spatial noise.
+
+    Scattering per family and concatenating keeps them separable, so `out` can
+    weight the two independently. Single-family arms take n_families=1 and this
+    is exactly the old behaviour.
+    """
+    if n_families == 1:
+        return scatter(he[edge_idx], node_idx, dim=0, dim_size=n, reduce=reduce)
+    if family_id is None:
+        raise ValueError(
+            f"layer expects {n_families} hyperedge families but the packed bag "
+            "carries no family_id. Either the cache predates family tagging "
+            "(rerun precompute for this arm) or the arm name and the data "
+            "disagree. Refusing to guess -- defaulting every hyperedge to "
+            "family 0 would silently zero half the layer.")
+    fam = family_id[edge_idx]                    # family of each INCIDENCE
+    outs = []
+    for f in range(n_families):
+        m = fam == f
+        if not bool(m.any()):                    # family absent in this region
+            outs.append(he.new_zeros(n, he.size(1)))
+            continue
+        outs.append(scatter(he[edge_idx[m]], node_idx[m], dim=0,
+                            dim_size=n, reduce=reduce))
+    return torch.cat(outs, dim=1)
+
+
 class DeepSetsHyperConv(nn.Module):
     """Set-aggregation hyperedge layer: node -> hyperedge -> node.
 
@@ -34,30 +68,36 @@ class DeepSetsHyperConv(nn.Module):
     density signal the pairwise baseline has.
     """
 
-    def __init__(self, in_dim, out_dim, hidden=None, back="mean"):
+    def __init__(self, in_dim, out_dim, hidden=None, back="mean", n_families=1):
         super().__init__()
         hidden = hidden or out_dim
         self.back = back
+        self.n_families = n_families
+        self.hidden = hidden
         self.phi = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
+        # rho stays SHARED across families -- log1p compresses 5 vs 200 members
+        # to 1.8 vs 5.3, which one transform handles. Only the return path has
+        # to be separated, because that is where the sum is irreversible.
         self.rho = nn.Sequential(nn.Linear(hidden + 1, hidden), nn.ReLU())
-        self.out = nn.Linear(hidden + in_dim, out_dim)
+        self.out = nn.Linear(hidden * n_families + in_dim, out_dim)
 
-    def forward(self, x, hyperedge_index, num_hyperedges=None):
+    def forward(self, x, hyperedge_index, num_hyperedges=None, family_id=None):
         node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
         n = x.size(0)
         if num_hyperedges is None:
             num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
         if num_hyperedges == 0:                       # degenerate region
-            return self.out(torch.cat([torch.zeros(n, self.rho[0].out_features,
-                                                   device=x.device), x], dim=1))
+            return self.out(torch.cat(
+                [torch.zeros(n, self.hidden * self.n_families, device=x.device),
+                 x], dim=1))
         m = self.phi(x)
         he = scatter(m[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
         size = scatter(torch.ones_like(edge_idx, dtype=x.dtype), edge_idx,
                        dim=0, dim_size=num_hyperedges, reduce="sum").unsqueeze(1)
         he = self.rho(torch.cat([he, size.log1p()], dim=1))
-        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n,
-                       reduce=self.back)
+        back = _back_by_family(he, node_idx, edge_idx, n, self.back,
+                               family_id, self.n_families)
         return self.out(torch.cat([back, x], dim=1))
 
 class SumHyperConv(nn.Module):
@@ -72,24 +112,26 @@ class SumHyperConv(nn.Module):
     `back` as in DeepSetsHyperConv.
     """
 
-    def __init__(self, in_dim, out_dim, hidden=None, back="mean"):
+    def __init__(self, in_dim, out_dim, hidden=None, back="mean", n_families=1):
         super().__init__()
         # `hidden` unused; signature matches DeepSetsHyperConv
         self.back = back
-        self.out = nn.Linear(2 * in_dim, out_dim)
+        self.n_families = n_families
+        self.out = nn.Linear((n_families + 1) * in_dim, out_dim)
 
-    def forward(self, x, hyperedge_index, num_hyperedges=None):
+    def forward(self, x, hyperedge_index, num_hyperedges=None, family_id=None):
         node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
         n = x.size(0)
         if num_hyperedges is None:
             num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
         if num_hyperedges == 0:                       # degenerate region
-            return self.out(torch.cat([torch.zeros_like(x), x], dim=1))
+            return self.out(torch.cat(
+                [x.new_zeros(n, x.size(1) * self.n_families), x], dim=1))
         # unnormalised: a hyperedge of 12 yields twice the magnitude of one of 6
         he = scatter(x[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
-        back = scatter(he[edge_idx], node_idx, dim=0, dim_size=n,
-                       reduce=self.back)
+        back = _back_by_family(he, node_idx, edge_idx, n, self.back,
+                               family_id, self.n_families)
         return self.out(torch.cat([back, x], dim=1))
 
 
@@ -129,6 +171,17 @@ class GINLayer(nn.Module):
                           dim_size=n, reduce="sum").unsqueeze(1)
             h = torch.cat([h, deg.log1p()], dim=1)
         return self.mlp(h)
+
+
+def n_families(arm):
+    """How many hyperedge families the construction carries.
+
+    Derived from the arm NAME rather than from data, because the layer's weight
+    shapes depend on it and must be fixed before any batch is seen. A region that
+    happens to contain no semantic hyperedges would otherwise silently build a
+    narrower layer than one that does.
+    """
+    return 2 if parse_arm(arm)[0].endswith("+semantic") else 1
 
 
 def parse_arm(arm):
@@ -223,6 +276,58 @@ class PairwiseRegionEncoder(nn.Module):
         return self.proj(_readout(x, batch, n_regions))
 
 
+class StarRegionEncoder(nn.Module):
+    """GIN over the star (bipartite incidence) expansion -> (n_regions, REGION_DIM).
+
+    The lossless pairwise comparator.
+
+    DEPTH DEFAULT IS AN ACTIVE DECISION, recorded here, printed at run time and
+    stored in the results JSON. It is not an accident of implementation.
+
+    Layers are not comparable units across the two architectures: a
+    DeepSetsHyperConv layer is two scatters and three transforms, a star GIN
+    layer is one scatter and one MLP, so two star layers roughly equal one
+    hypergraph layer in both hops and transform count. At n_layers=2 the
+    hypergraph arm would hold 2x the reach; n_layers=4 matches reach instead.
+
+    DEFAULT 4 -- the setting that favours the BASELINE. Capacity matching
+    equalises total parameters, so the extra depth is not extra budget: star
+    trades width for depth (hidden 44 -> 34) and takes on oversmoothing risk.
+    Chosen so that a hypergraph win cannot be attributed to reach the baseline
+    was denied.
+
+    Neither depth is "the fair one". Sweep 2/3/4 and report the depth at which
+    star catches the hypergraph -- that exchange rate is a measurement a reader
+    can argue with, where a single chosen depth is a judgement they cannot.
+
+    GIN rather than GCNConv: the star graph is bipartite and wildly
+    degree-imbalanced (a 196-member hyperedge node against a cell in ~8
+    hyperedges), so 1/sqrt(d_i d_j) would divide out exactly the cardinality
+    signal the comparison exists to test.
+
+    The readout pools over CELL nodes only -- see pack_star.
+    """
+
+    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, n_layers=4):
+        super().__init__()
+        if n_layers < 2:
+            raise ValueError(
+                f"n_layers={n_layers}: information cannot reach a cell in under "
+                "two hops on a star graph (cell -> hyperedge -> cell), and "
+                "hyperedge nodes start at zero, so one layer tells cells nothing")
+        dims = [in_dim] + [hidden] * n_layers
+        self.convs = nn.ModuleList([GINLayer(dims[i], dims[i + 1])
+                                    for i in range(n_layers)])
+        self.n_layers = n_layers
+        self.proj = nn.Linear(3 * hidden, out_dim)
+        self.out_dim = out_dim
+
+    def forward(self, x, edge_index, batch, n_regions, cell_mask):
+        for c in self.convs:
+            x = F.relu(c(x, edge_index))
+        return self.proj(_readout(x[cell_mask], batch[cell_mask], n_regions))
+
+
 class HyperRegionEncoder(nn.Module):
     """2-layer hypergraph encoder over all a slide's regions at once.
 
@@ -240,7 +345,8 @@ class HyperRegionEncoder(nn.Module):
             "sum":       (SumHyperConv, "mean"),
             "sum2":      (SumHyperConv, "sum")}
 
-    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None):
+    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None,
+                 n_families=1):
         super().__init__()
         agg = agg or "deepsets"
         if agg not in self.AGGS:
@@ -248,14 +354,16 @@ class HyperRegionEncoder(nn.Module):
                              f"{sorted(self.AGGS)}")
         Conv, back = self.AGGS[agg]
         self.agg = agg
-        self.c1 = Conv(in_dim, hidden, back=back)
-        self.c2 = Conv(hidden, hidden, back=back)
+        self.n_families = n_families
+        self.c1 = Conv(in_dim, hidden, back=back, n_families=n_families)
+        self.c2 = Conv(hidden, hidden, back=back, n_families=n_families)
         self.proj = nn.Linear(3 * hidden, out_dim)
         self.out_dim = out_dim
 
-    def forward(self, x, hyperedge_index, batch, n_regions, num_hyperedges):
-        x = F.relu(self.c1(x, hyperedge_index, num_hyperedges))
-        x = F.relu(self.c2(x, hyperedge_index, num_hyperedges))
+    def forward(self, x, hyperedge_index, batch, n_regions, num_hyperedges,
+                family_id=None):
+        x = F.relu(self.c1(x, hyperedge_index, num_hyperedges, family_id))
+        x = F.relu(self.c2(x, hyperedge_index, num_hyperedges, family_id))
         return self.proj(_readout(x, batch, n_regions))
 
 
@@ -283,37 +391,113 @@ def pack_pairwise(region_graphs):
 def pack_hyper(region_graphs):
     """Combine a slide's hypergraph regions into one disconnected hypergraph.
     Node ids AND hyperedge ids are offset per region so nothing merges across
-    regions. Returns x, hyperedge_index, batch, R, total_hyperedges."""
-    xs, his, batch = [], [], []
+    regions. Returns x, hyperedge_index, batch, R, total_hyperedges, family_id.
+
+    Regions are (x, hyperedge_index) or (x, hyperedge_index, family_id). The
+    family vector is indexed by GLOBAL hyperedge id, so it has to be padded to
+    edge_off for every region -- a region whose hyperedge count exceeds its own
+    tags would otherwise shift every later region's families by the shortfall.
+    family_id is None when no region carried one.
+    """
+    xs, his, batch, fams = [], [], [], []
     node_off, edge_off = 0, 0
     dev = region_graphs[0][0].device
-    # multi-family arms cache a third slot (per-hyperedge family tag); it is
-    # carried but not yet consumed, so unpack by index rather than by arity
+    any_fam = any(len(g) > 2 and g[2] is not None for g in region_graphs)
     for r, g in enumerate(region_graphs):
         x, hi = g[0], g[1]
+        fam = g[2] if len(g) > 2 else None
         xs.append(x)
         if hi.numel():
             h = hi.clone()
             h[0] += node_off
             h[1] += edge_off
             his.append(h)
-            edge_off += int(hi[1].max()) + 1
+            n_he = int(hi[1].max()) + 1
+            if any_fam:
+                fams.append(fam.to(dev) if fam is not None
+                            else torch.zeros(n_he, dtype=torch.long, device=dev))
+            edge_off += n_he
         batch.append(torch.full((x.size(0),), r, dtype=torch.long, device=dev))
         node_off += x.size(0)
     hyperedge_index = (torch.cat(his, 1) if his
                        else torch.empty((2, 0), dtype=torch.long, device=dev))
+    family_id = torch.cat(fams) if fams else None
     return (torch.cat(xs, 0), hyperedge_index,
-            torch.cat(batch), len(region_graphs), edge_off)
+            torch.cat(batch), len(region_graphs), edge_off, family_id)
 
 
-def pack_bag(region_graphs, is_pw, regions_per_batch=16):
+def pack_star(region_graphs):
+    """Star-expand a slide's hypergraph regions into ONE bipartite graph.
+
+    Adds a node per hyperedge, joined to its members. This is the only LOSSLESS
+    pairwise encoding of a hypergraph, and unlike clique expansion it is O(1) per
+    incidence rather than quadratic in cardinality -- so it is the tractable
+    pairwise comparator for arms whose hyperedges reach 196 members.
+
+    It is also, transparently, the hypergraph drawn differently: one hypergraph
+    layer is node->hyperedge->node, which is exactly TWO hops here. A star arm
+    therefore needs 2x the layers to match a hypergraph arm's reach, and that
+    factor is the measurement, not an inconvenience.
+
+    Hyperedge nodes get ZERO features. Seeding them with the mean of their
+    members would perform the aggregation before the network does, which is the
+    thing under test. Returns x, edge_index, batch, R, cell_mask -- cell_mask is
+    load-bearing: the readout must pool over CELLS only, or every region vector
+    gets diluted by however many hyperedges it happens to contain.
+    """
+    xs, eis, batch, mask = [], [], [], []
+    node_off = 0
+    dev = region_graphs[0][0].device
+    for r, g in enumerate(region_graphs):
+        x, hi = g[0], g[1]
+        n_cells = x.size(0)
+        n_he = (int(hi[1].max()) + 1) if hi.numel() else 0
+        xs.append(torch.cat([x, x.new_zeros(n_he, x.size(1))], dim=0))
+        if hi.numel():
+            # incidence -> undirected edge between member and its hyperedge node
+            src = hi[0] + node_off
+            dst = hi[1] + node_off + n_cells
+            eis.append(torch.stack([torch.cat([src, dst]),
+                                    torch.cat([dst, src])]))
+        total = n_cells + n_he
+        batch.append(torch.full((total,), r, dtype=torch.long, device=dev))
+        m = torch.zeros(total, dtype=torch.bool, device=dev)
+        m[:n_cells] = True
+        mask.append(m)
+        node_off += total
+    edge_index = (torch.cat(eis, 1) if eis
+                  else torch.empty((2, 0), dtype=torch.long, device=dev))
+    return (torch.cat(xs, 0), edge_index, torch.cat(batch),
+            len(region_graphs), torch.cat(mask))
+
+
+def pack_mode(arm):
+    """'pw' | 'hyper' | 'star' -- which packer an arm needs.
+
+    Star arms read the HYPERGRAPH cache (the incidence structure is the bipartite
+    edge list), so the construction half of the name is unchanged and only the
+    aggregation half selects the encoding.
+    """
+    construction, agg = parse_arm(arm)
+    if construction.startswith("pw-"):
+        return "pw"
+    return "star" if agg == "star" else "hyper"
+
+
+def pack_bag(region_graphs, mode, regions_per_batch=16):
     """Pack one slide's regions into memory-bounded groups, once.
 
     Deterministic in the region graphs, so call it per slide before training and
     reuse the result rather than repeating the torch.cat on every pass. Region
     boundaries are never split, so grouping changes no region vector.
+
+    mode: 'pw' | 'hyper' | 'star', from pack_mode(arm). A bool is accepted for
+    the old is_pw calling convention.
     """
-    packer = pack_pairwise if is_pw else pack_hyper
+    if isinstance(mode, bool):
+        mode = "pw" if mode else "hyper"
+    packer = {"pw": pack_pairwise, "hyper": pack_hyper,
+              "star": pack_star}[mode]
     return [packer(region_graphs[i:i + regions_per_batch])
             for i in range(0, len(region_graphs), regions_per_batch)]
 
@@ -348,15 +532,26 @@ class MILClassifier(nn.Module):
     """
 
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
-                 regions_per_batch=16):
+                 regions_per_batch=16, blend_families=False, star_layers=4):
         super().__init__()
         self.arm = arm
         construction, agg = parse_arm(arm)
         self.construction, self.agg = construction, agg
         self.is_pw = construction.startswith("pw-")
-        self.encoder = (PairwiseRegionEncoder(in_dim, hidden, agg=agg)
-                        if self.is_pw
-                        else HyperRegionEncoder(in_dim, hidden, agg=agg))
+        # blend_families is the ABLATION: force one family so both scatter into
+        # the same vector, which is what the arm does if you ignore that a
+        # 200-cell semantic hyperedge and a 5-cell spatial one are different
+        # objects. Run it once to show it fails; it is not a usable setting.
+        nf = 1 if blend_families else n_families(arm)
+        self.mode = pack_mode(arm)
+        if self.mode == "pw":
+            self.encoder = PairwiseRegionEncoder(in_dim, hidden, agg=agg)
+        elif self.mode == "star":
+            self.encoder = StarRegionEncoder(in_dim, hidden,
+                                             n_layers=star_layers)
+        else:
+            self.encoder = HyperRegionEncoder(in_dim, hidden, agg=agg,
+                                              n_families=nf)
         self.pool_kind = pool
         self.rpb = regions_per_batch
         if pool == "attention":
@@ -367,12 +562,15 @@ class MILClassifier(nn.Module):
         """Encode pre-packed groups to (R, REGION_DIM)."""
         vecs = []
         for g in packed:
-            if self.is_pw:
+            if self.mode == "pw":
                 x, ei, batch, R = g
                 vecs.append(self.encoder(x, ei, batch, R))
+            elif self.mode == "star":
+                x, ei, batch, R, cell_mask = g
+                vecs.append(self.encoder(x, ei, batch, R, cell_mask))
             else:
-                x, hi, batch, R, n_he = g
-                vecs.append(self.encoder(x, hi, batch, R, n_he))
+                x, hi, batch, R, n_he, fam = g
+                vecs.append(self.encoder(x, hi, batch, R, n_he, fam))
         return torch.cat(vecs, dim=0)          # attached: gradients flow through all groups
 
     def forward(self, bag):
@@ -384,7 +582,7 @@ class MILClassifier(nn.Module):
         The arity test must accept BOTH raw widths or a 3-tuple region list gets
         mistaken for pre-packed and fails somewhere unrelated.
         """
-        packed = (pack_bag(bag, self.is_pw, self.rpb)
+        packed = (pack_bag(bag, self.mode, self.rpb)
                   if bag and len(bag[0]) in (2, 3) else bag)
         region_vecs = self._encode_regions(packed)
         if self.pool_kind == "attention":
@@ -406,7 +604,7 @@ class NodeClassifier(nn.Module):
     including the @agg suffix.
     """
 
-    def __init__(self, arm, in_dim, hidden, n_classes):
+    def __init__(self, arm, in_dim, hidden, n_classes, blend_families=False):
         super().__init__()
         construction, agg = parse_arm(arm)
         self.is_pw = construction.startswith("pw-")
@@ -423,17 +621,18 @@ class NodeClassifier(nn.Module):
                 raise ValueError(f"unknown hypergraph agg {agg!r}; expected one "
                                  f"of {sorted(HyperRegionEncoder.AGGS)}")
             Conv, back = HyperRegionEncoder.AGGS[agg]
-            self.c1 = Conv(in_dim, hidden, back=back)
-            self.c2 = Conv(hidden, hidden, back=back)
+            nf = 1 if blend_families else n_families(arm)
+            self.c1 = Conv(in_dim, hidden, back=back, n_families=nf)
+            self.c2 = Conv(hidden, hidden, back=back, n_families=nf)
         self.head = nn.Linear(hidden, n_classes)
 
-    def forward(self, x, struct, num_hyperedges=None):
+    def forward(self, x, struct, num_hyperedges=None, family_id=None):
         if self.is_pw:
             x = F.relu(self.c1(x, struct))
             x = F.relu(self.c2(x, struct))
         else:
-            x = F.relu(self.c1(x, struct, num_hyperedges))
-            x = F.relu(self.c2(x, struct, num_hyperedges))
+            x = F.relu(self.c1(x, struct, num_hyperedges, family_id))
+            x = F.relu(self.c2(x, struct, num_hyperedges, family_id))
         return self.head(x)
 
 
