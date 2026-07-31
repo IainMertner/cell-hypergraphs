@@ -6,11 +6,13 @@
 #
 #     qsub scripts/run_masked.sh
 #     qsub -v FEATURES=none,ARMS="pw-knn hg-radius@sum2",REGIONS=20 scripts/run_masked.sh
+#
+# CPU-only: the models are small enough that a GPU buys minutes and costs an
+# hour in the queue. Add -l gpu=1 on the command line if you ever need one.
 
 #$ -N masked
 #$ -l h_rt=0:20:0
-#$ -l mem=32G
-#$ -l gpu=1
+#$ -l mem=8G
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
 #$ -o /home/ucabim3/Scratch/logs/masked.out
 #$ -e /home/ucabim3/Scratch/logs/masked.err
@@ -23,7 +25,7 @@ python -c "import torch" 2>/dev/null || {
 mkdir -p /home/ucabim3/Scratch/logs
 
 echo "=== $(date) on $(hostname) ==="
-nvidia-smi --query-gpu=name --format=csv,noheader || echo "no GPU -- will be slow"
+nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "CPU only"
 
 ARMS="${ARMS:-pw-knn hg-knn hg-radius}"
 REGIONS="${REGIONS:-10}"
