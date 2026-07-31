@@ -199,6 +199,8 @@ def main():
           f"| {args.regions} regions x {args.seeds} seeds")
     if args.features == "none":
         print("features=none  <- constant node features: TOPOLOGY ONLY.")
+        print("  nothing is masked (there is nothing to hide), so ALL nodes are")
+        print("  used, split 60/20/20 -- not the 30% subset the other modes use.")
         print("  sum aggregation reduces to reading hyperedge cardinality here,")
         print("  so hg-knn (fixed at k+1) should sit at the FLOOR while")
         print("  hg-radius (varies 6-15) still has something to read.")
@@ -247,13 +249,30 @@ def main():
         for s in range(args.seeds):
             set_seed(s)
             rng = np.random.default_rng(s)
-            targets = rng.permutation(n)[:int(n * args.mask_frac)]
+            # features=none masks nothing, so restricting to a 30% subset would
+            # just discard 70% of the labels for no reason -- every node is
+            # equally "predict this from structure". Use them all: the test set
+            # goes from 6% of nodes (20% of a 30% subset) to 20%.
+            #
+            # The other modes still need masking. Under type/both the label is
+            # literally in the node's own features; under morph its own shape is
+            # a strong cue, and hiding it is what forces the prediction to come
+            # from CONTEXT rather than from the cell itself.
+            frac = 1.0 if args.features == "none" else args.mask_frac
+            targets = rng.permutation(n)[:int(n * frac)]
             n_tr, n_va = int(len(targets) * 0.6), int(len(targets) * 0.2)
             tr = torch.from_numpy(targets[:n_tr]).long()
             va = torch.from_numpy(targets[n_tr:n_tr + n_va]).long()
             te = torch.from_numpy(targets[n_tr + n_va:]).long()
             xm = x.clone()
-            xm[torch.from_numpy(targets).long()] = 0.0   # hide the target cells
+            if args.features != "none":
+                xm[torch.from_numpy(targets).long()] = 0.0  # hide the targets
+            # features=none: nothing to hide, and zeroing WOULD do harm. With
+            # 0/1 inputs, sum-pooling reads the count of UNMASKED members --
+            # Binomial(|e|, 0.7) -- so cardinality arrives with ~27% noise, and
+            # hg-knn (constant |e|=6) picks up spurious variation that is pure
+            # noise. Left at 1, `he` is exactly |e|, so "hg-knn has no
+            # cardinality signal" is a clean prediction rather than a muddy one.
 
             for a in args.arms:
                 set_seed(s)
