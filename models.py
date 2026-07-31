@@ -361,6 +361,45 @@ class MILClassifier(nn.Module):
         return self.head(slide_vec), att
 
 
+class NodeClassifier(nn.Module):
+    """2 conv layers + linear head, per-NODE output. No pooling, no MIL.
+
+    For the masked-cell-type task, which is the cleanest diagnostic available
+    for the encoders themselves:
+
+      - supervision is PER CELL, so a single region gives thousands of labels
+        instead of the one label a whole slide gives. Sample size stops being
+        the binding constraint.
+      - nothing downstream of the encoder is involved. No attention pooling, no
+        bag aggregation. If an arm underperforms here it is the encoder, and if
+        arms tie here but differ on the slide task, the difference lives in the
+        MIL stage instead.
+
+    Shares its conv layers with the MIL encoders, so `arm` accepts the same
+    names including the @agg suffix (hg-knn@sum, hg-radius@deepsets, ...).
+    """
+
+    def __init__(self, arm, in_dim, hidden, n_classes):
+        super().__init__()
+        construction, agg = parse_arm(arm)
+        self.is_pw = construction.startswith("pw-")
+        if self.is_pw:
+            self.c1, self.c2 = GCNConv(in_dim, hidden), GCNConv(hidden, hidden)
+        else:
+            Conv = HyperRegionEncoder.AGGS[agg]
+            self.c1, self.c2 = Conv(in_dim, hidden), Conv(hidden, hidden)
+        self.head = nn.Linear(hidden, n_classes)
+
+    def forward(self, x, struct, num_hyperedges=None):
+        if self.is_pw:
+            x = F.relu(self.c1(x, struct))
+            x = F.relu(self.c2(x, struct))
+        else:
+            x = F.relu(self.c1(x, struct, num_hyperedges))
+            x = F.relu(self.c2(x, struct, num_hyperedges))
+        return self.head(x)
+
+
 class AbundanceOnly(nn.Module):
     """Triviality control: predict the label from per-slide cell-type fractions
     ONLY. No spatial structure. If this matches the graph arms, the task is
