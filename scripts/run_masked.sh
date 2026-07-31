@@ -14,7 +14,14 @@
 # =============================================================================
 
 #$ -N masked
-#$ -l h_rt=2:0:0
+# 10 min, not hours. A 5-arm x 10-region x 3-seed run measured ~30s on an A100:
+# each training run is a 2-layer GNN over a few thousand nodes, so an epoch is
+# milliseconds. Walltime is the main thing hurting GPU placement on this
+# cluster, so ask for what the job needs plus headroom, not a round number.
+#
+# Cost scales with ARMS x REGIONS x SEEDS. If you push those up an order of
+# magnitude, raise this with -l h_rt=... on the submit line rather than editing.
+#$ -l h_rt=0:10:0
 #$ -l mem=32G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs

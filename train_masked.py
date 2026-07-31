@@ -233,7 +233,12 @@ def main():
               f"{n_params(_node(a)(in_dim, hidden[a], N_TYPES)):>7,} params")
 
     scores = {a: [] for a in args.arms}
-    floor = None
+    # Track BOTH baselines across every region, not just the first. Majority
+    # accuracy matters as much as the macro-F1 floor: with inverse-frequency
+    # weights the model spreads predictions across classes, which RAISES
+    # macro-F1 and LOWERS accuracy -- so an arm can look respectable on accuracy
+    # while being worse than always answering the dominant class.
+    floors, majs, presents = [], [], []
     for ri, (x, structs, y) in enumerate(regions):
         n = x.shape[0]
         counts = np.bincount(y.numpy(), minlength=N_TYPES)
@@ -241,7 +246,9 @@ def main():
         # macro-F1 a single-class predictor would score, over classes PRESENT
         present = int((counts > 0).sum())
         f_floor = (2 * maj / (maj + 1)) / present
-        floor = f_floor if floor is None else floor
+        floors.append(f_floor)
+        majs.append(maj)
+        presents.append(present)
         # inverse-frequency weights over present classes
         w = torch.tensor([n / (present * c) if c else 0.0 for c in counts],
                          dtype=torch.float)
@@ -289,11 +296,19 @@ def main():
 
     print(f"\n=== masked cell-type prediction, {len(regions)} regions "
           f"x {args.seeds} seeds ===")
-    print(f"  majority-collapse macroF1 floor ~{floor:.3f}")
+    maj_acc, floor = float(np.mean(majs)), float(np.mean(floors))
+    print(f"  BASELINES (mean over regions, {min(presents)}-{max(presents)} "
+          f"classes present)")
+    print(f"    majority accuracy {maj_acc:.3f}   <- an arm below this is worse "
+          f"than always")
+    print(f"                                         answering the dominant class")
+    print(f"    macroF1 floor     {floor:.3f}   <- what that same predictor scores")
     for a in args.arms:
         v = np.array(scores[a])
-        print(f"  {a:<16} acc {v[:, 0].mean():.3f} +- {v[:, 0].std():.3f} "
-              f"| macroF1 {v[:, 1].mean():.3f} +- {v[:, 1].std():.3f}")
+        acc, f1 = v[:, 0].mean(), v[:, 1].mean()
+        print(f"  {a:<20} acc {acc:.3f} +- {v[:, 0].std():.3f} "
+              f"| macroF1 {f1:.3f} +- {v[:, 1].std():.3f}"
+              + ("  [acc BELOW majority]" if acc < maj_acc else ""))
     print("\nPer-CELL supervision, so thousands of labels per region -- sample")
     print("size is not the constraint here, and no MIL or attention pooling is")
     print("involved. A difference between arms is the ENCODER. A tie is weak")
