@@ -34,6 +34,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy import stats
 
 from graphs import N_TYPES, DEFAULT_ARMS
 from models import set_seed, matched_hidden, n_params, macro_f1, NodeClassifier, parse_arm
@@ -134,6 +135,35 @@ def train_eval_region(model, x, struct, n_he, y, tr, va, te, is_pw,
     return float((p == t).mean()), macro_f1(p, t, N_TYPES)
 
 
+def paired_region_test(a_runs, b_runs, n_regions, n_seeds):
+    """Paired test of arm a against arm b. Returns (mean, lo, hi, p, win rate).
+
+    Runs are stored region-major, so index ri*n_seeds+s, and arms see identical
+    (region, seed, split) -- paired index-for-index.
+
+    Seeds within a region resplit the SAME cells, so those runs are dependent;
+    different regions are different tissue and are not. Averaging seeds within a
+    region collapses the dependent axis and leaves n_regions independent paired
+    differences, which a plain paired t-test handles. No Nadeau-Bengio term:
+    that corrects for training-set overlap between runs, and averaging has
+    already absorbed the only overlap present.
+
+    The win rate is over ALL runs, not region means -- it is the robust reading
+    when n_regions is small enough that the CI is wide.
+    """
+    a, b = np.asarray(a_runs, float), np.asarray(b_runs, float)
+    d = (a.reshape(n_regions, n_seeds).mean(1)
+         - b.reshape(n_regions, n_seeds).mean(1))
+    mean, n = float(d.mean()), len(d)
+    wins = float((a > b).mean())
+    if n < 2 or d.std(ddof=1) == 0:
+        return mean, float("nan"), float("nan"), float("nan"), wins
+    se = float(d.std(ddof=1) / np.sqrt(n))
+    tcrit = float(stats.t.ppf(0.975, n - 1))
+    return (mean, mean - tcrit * se, mean + tcrit * se,
+            float(2 * stats.t.sf(abs(mean / se), df=n - 1)), wins)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--graph-cache", default="graph_cache")
@@ -149,9 +179,21 @@ def main():
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--patience", type=int, default=30)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--compare-to", default=None,
+                    help="arm every other arm is tested against, paired per "
+                         "region. Default: the first arm listed")
+    ap.add_argument("--capacity-ref", default=None,
+                    help="arm whose parameter count the others are matched to. "
+                         "Defaults to the first non-pw arm, which makes the "
+                         "target depend on arm ORDER -- pin it explicitly if "
+                         "you need runs to be comparable to each other")
     ap.add_argument("--device",
                     default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    for flag, val in (("--compare-to", args.compare_to),
+                      ("--capacity-ref", args.capacity_ref)):
+        if val is not None and val not in args.arms:
+            raise SystemExit(f"{flag} {val!r} is not in --arms {args.arms}")
 
     print(f"masked cell-type prediction | arms={args.arms} "
           f"| {args.regions} regions x {args.seeds} seeds")
@@ -180,7 +222,8 @@ def main():
     # capacity match every arm to the deepsets hypergraph, as train_patterns does
     def _node(a):
         return lambda i, h, o: NodeClassifier(a, i, h, o)
-    ref_arm = next((a for a in args.arms if not a.startswith("pw-")), args.arms[0])
+    ref_arm = args.capacity_ref or next(
+        (a for a in args.arms if not a.startswith("pw-")), args.arms[0])
     target = n_params(_node(ref_arm)(in_dim, args.hidden, N_TYPES))
     hidden = {a: (args.hidden if a == ref_arm
                   else matched_hidden(_node(a), target, in_dim, N_TYPES))
@@ -257,6 +300,30 @@ def main():
         print(f"  {a:<20} acc {acc:.3f} +- {v[:, 0].std():.3f} "
               f"| macroF1 {f1:.3f} +- {v[:, 1].std():.3f}"
               + ("  [acc BELOW majority]" if acc < maj_acc else ""))
+    ref = args.compare_to or args.arms[0]
+    others = [a for a in args.arms if a != ref]
+    if others:
+        nr = len(regions)
+        print(f"\n=== paired against {ref} ===")
+        print(f"  per-region mean differences, n={nr} independent regions | "
+              f"95% CI, paired t")
+        print(f"  {'arm':<20} {'metric':<8} {'diff':>7}  {'95% CI':<18} "
+              f"{'p':>6}  wins")
+        for a in others:
+            for mi, mname in ((1, "macroF1"), (0, "acc")):
+                m, lo, hi, p, w = paired_region_test(
+                    [s[mi] for s in scores[a]], [s[mi] for s in scores[ref]],
+                    nr, args.seeds)
+                ci = ("n/a" if np.isnan(lo)
+                      else f"[{lo:+.3f}, {hi:+.3f}]")
+                sig = "  *" if not np.isnan(p) and p < 0.05 else ""
+                print(f"  {a:<20} {mname:<8} {m:>+7.3f}  {ci:<18} "
+                      f"{'n/a' if np.isnan(p) else f'{p:.3f}':>6}  "
+                      f"{w:.0%}{sig}")
+        print("  * CI excludes zero. Seeds within a region resplit the same "
+              "cells, so they are\n    averaged before testing; regions are "
+              "independent tissue and carry the df.")
+
     print("\nPer-cell supervision and no MIL stage, so a difference between arms")
     print("is the ENCODER. A tie is weak evidence -- cell type is partly readable")
     print("off the neighbours, so both arms may be at ceiling.")
