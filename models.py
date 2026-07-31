@@ -9,6 +9,8 @@ Everything downstream of the encoder is shared across arms, so the arm is the
 only thing that varies.
 """
 
+from functools import partial
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -91,6 +93,44 @@ class SumHyperConv(nn.Module):
         return self.out(torch.cat([back, x], dim=1))
 
 
+class GINLayer(nn.Module):
+    """GIN (Xu et al. 2019): MLP((1+eps) x_i + sum_j x_j).
+
+    The PAIRWISE realisation of rho(sum phi(x)) -- GIN is derived from the same
+    Deep Sets result DeepSetsHyperConv uses, over an adjacency list instead of a
+    hyperedge. It is therefore the arm that says whether DeepSetsHyperConv's
+    margin comes from the hyperedge or just from having an MLP per hop.
+
+    use_degree concatenates log1p(deg_i), the pairwise twin of the log1p(|e|)
+    channel DeepSetsHyperConv feeds to rho. That isolates the last mechanism
+    that is not shared: cardinality as its OWN input rather than as the
+    magnitude of the sum. If this closes the gap, explicit set size explains the
+    result and it was never a hypergraph property -- it ports to a graph in one
+    line, which is this one.
+    """
+
+    def __init__(self, in_dim, out_dim, use_degree=False):
+        super().__init__()
+        self.use_degree = use_degree
+        self.eps = nn.Parameter(torch.zeros(1))
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim + (1 if use_degree else 0), out_dim), nn.ReLU(),
+            nn.Linear(out_dim, out_dim))
+
+    def forward(self, x, edge_index):
+        src, dst = edge_index[0], edge_index[1]
+        n = x.size(0)
+        agg = scatter(x[src], dst, dim=0, dim_size=n, reduce="sum")
+        h = (1 + self.eps) * x + agg
+        if self.use_degree:
+            # edges are symmetrised with no self-loops, so this is |N(i)|;
+            # hg-radius sees |e_i| = deg_i + 1, the same quantity offset by one
+            deg = scatter(torch.ones_like(dst, dtype=x.dtype), dst, dim=0,
+                          dim_size=n, reduce="sum").unsqueeze(1)
+            h = torch.cat([h, deg.log1p()], dim=1)
+        return self.mlp(h)
+
+
 def parse_arm(arm):
     """'hg-knn@sum' -> ('hg-knn', 'sum');  'hg-knn' -> ('hg-knn', None).
 
@@ -130,20 +170,28 @@ class PairwiseRegionEncoder(nn.Module):
 
     Emits REGION_DIM, via the same linear adapter as HyperRegionEncoder.
 
-    agg="gcn" -> GCNConv, degree-normalised by 1/sqrt(d_i d_j). THE DEFAULT,
-                 and what every pairwise result before this used.
-    agg="sum" -> GraphConv (Morris et al.), W1 x_i + W2 sum_j x_j: unnormalised
-                 sum, one transform. This is the pairwise twin of SumHyperConv,
-                 which is also one linear over [aggregate ; self] -- same shape,
-                 same parameter count, so the arms differ only in whether the
-                 neighbourhood is a hyperedge or an adjacency list.
+    Each agg is the pairwise twin of one hypergraph arm, so a matched pair
+    isolates one mechanism at a time:
 
-    Without it the aggregation function was confounded with the construction:
+    agg="gcn"     GCNConv, degree-normalised by 1/sqrt(d_i d_j). THE DEFAULT,
+                  and what every pairwise result before this used.
+    agg="sum"     GraphConv (Morris et al.), W1 x_i + W2 sum_j x_j. Twin of
+                  SumHyperConv -- also one linear over [aggregate ; self], same
+                  parameter count. Isolates unnormalised sum.
+    agg="gin"     GIN. Twin of DeepSetsHyperConv without its size channel.
+                  Isolates the per-hop MLP.
+    agg="gin+deg" GIN with log1p(deg) concatenated. Twin of DeepSetsHyperConv
+                  WITH its size channel. Isolates explicit cardinality.
+
+    Without these the aggregation function was confounded with the construction:
     every pw arm normalised, every hg arm summed, so "hypergraphs win" and "sum
     beats normalisation" (Xu et al., GIN) were not separable.
     """
 
-    AGGS = {"gcn": GCNConv, "sum": GraphConv}
+    AGGS = {"gcn": GCNConv,
+            "sum": GraphConv,
+            "gin": GINLayer,
+            "gin+deg": partial(GINLayer, use_degree=True)}
 
     def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None):
         super().__init__()

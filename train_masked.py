@@ -11,9 +11,13 @@ from both the sample size and the MIL stage.
          cell, so the task reduces to reading a neighbourhood type histogram --
          which flatters sum aggregation trivially.
   morph  5-d morphology only (area, perimeter, circularity, eccentricity,
-         extent). The label is nowhere in the input. THE DEFAULT.
+         extent). The label is not literally in the input, but morphology is a
+         strong PROXY for type -- small and round reads as lymphocyte -- so the
+         same leak survives at lower fidelity. Less circular, not non-circular.
+         THE DEFAULT.
   both   all 10 dims. As circular as `type`.
-  none   constant features; see select_features.
+  none   constant features. The only mode with no leak at all, since a constant
+         correlates with nothing; see select_features.
 
 The topology is never a leak -- every construction is built from centroids.
 
