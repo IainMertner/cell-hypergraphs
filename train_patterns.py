@@ -127,8 +127,18 @@ def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
 
 def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, seed,
                    abundance=None, device="cpu", patience=20, class_weight=None,
-                   select_on="macro_f1"):
+                   select_on="macro_f1", batch_size=8):
     """Train on `tr`, early-stop on `va`, score `te`. Returns (accuracy, macro-F1).
+
+    batch_size: slides per optimiser step. This was FULL BATCH -- gradients
+    accumulated over every training slide and one opt.step() per epoch -- which
+    made an epoch a single optimiser step. With patience 20, every run then
+    stopped near step 30 whatever the epoch cap was, so models trained for about
+    ten gradient steps and the sweep compared early-training trajectories rather
+    than converged models. Observed: best@2..13, stop@22..33, against a cap of
+    150. Minibatching gives ~n/batch steps per epoch for the same number of
+    forward/backward passes, so it costs no wall-clock. batch_size<=0 restores
+    the old full-batch behaviour.
 
     class_weight: per-class inverse-frequency loss weights, so the model is not
     rewarded for collapsing to the majority class.
@@ -157,11 +167,17 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     # the sum of weights, so on a single sample w_c*l/w_c = l and the class weight
     # cancels -- passing `weight` inside a per-sample loop is a silent no-op.
     # reduction='sum' over sum(w_y) reproduces the true batched weighted loss.
-    if class_weight is not None:
-        idx = torch.as_tensor(np.asarray(tr), device=labels_t.device).long()
-        denom = float(class_weight[labels_t[idx]].sum())
-    else:
-        denom = float(len(tr))
+    def _denom(chunk):
+        """Total loss weight of a minibatch -- the correct weighted-mean divisor.
+
+        Must be the CHUNK's weight, not the fold's. Dividing a minibatch by the
+        whole fold's weight would shrink every gradient by batch/n and silently
+        scale the learning rate down by the same factor.
+        """
+        if class_weight is None:
+            return float(len(chunk))
+        idx = torch.as_tensor(np.asarray(chunk), device=labels_t.device).long()
+        return float(class_weight[labels_t[idx]].sum())
 
     def run(i):
         if abundance is not None:
@@ -182,14 +198,21 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     # because no model here has running buffers.
     best_val, best_state, since = -1.0, None, 0
     stopped_at, best_epoch = epochs, 0
+    rng = np.random.default_rng(seed)          # own stream, so shuffling cannot
+    tr = np.asarray(tr)                        # perturb model init reproducibly
+    bs = len(tr) if batch_size <= 0 else min(batch_size, len(tr))
     for ep in range(1, epochs + 1):
         model.train()
-        opt.zero_grad()
-        for i in tr:
-            loss = F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1],
-                                   weight=class_weight, reduction="sum") / denom
-            loss.backward()          # accumulates into .grad; graph freed here
-        opt.step()
+        order = tr[rng.permutation(len(tr))]
+        for start in range(0, len(order), bs):
+            chunk = order[start:start + bs]
+            d = _denom(chunk)
+            opt.zero_grad()
+            for i in chunk:
+                loss = F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1],
+                                       weight=class_weight, reduction="sum") / d
+                loss.backward()      # accumulates into .grad; graph freed here
+            opt.step()
         model.eval()
         with torch.no_grad():
             vp = preds(va)
@@ -330,6 +353,10 @@ def main():
                          "slides, for learning curves")
     ap.add_argument("--subsample-seed", type=int, default=0,
                     help="which subsample to draw; vary to average over draws")
+    ap.add_argument("--batch-size", type=int, default=8,
+                    help="slides per optimiser step. Was full-batch, which made "
+                         "an epoch ONE step and left every run stopping on "
+                         "patience after ~10 useful steps. 0 restores that")
     ap.add_argument("--select-on", choices=["acc", "macro_f1"],
                     default="macro_f1",
                     help="early-stopping metric; acc rewards majority collapse "
@@ -505,6 +532,15 @@ def main():
     if args.seed is not None:
         print(f"SEED {args.seed} ONLY -- this is one part of a split sweep; "
               f"merge with combine_results.py")
+    # An epoch used to be ONE optimiser step, so `epochs` and `patience` meant
+    # something very different from what they read like. Print the conversion.
+    n_tr_mean = float(np.mean([len(t) for _, t, _, _ in runs]))
+    steps = (max(1, int(np.ceil(n_tr_mean / args.batch_size)))
+             if args.batch_size > 0 else 1)
+    print(f"batch {args.batch_size if args.batch_size > 0 else 'full'} "
+          f"slides/step -> ~{steps} optimiser steps/epoch, "
+          f"<={steps * args.epochs:,} per run "
+          f"(patience {args.patience} epochs = {steps * args.patience:,} steps)")
     print(f"{args.folds}-fold patient-grouped stratified CV, resampled per seed; "
           f"seeds {seed_list} -> {len(runs)} runs/arm")
     print(f"fold test sizes (seed {seed_list[0]}) "
@@ -541,7 +577,8 @@ def main():
                                    0.01, s, abundance=abund,
                                    device=args.device, class_weight=class_weight,
                                    patience=args.patience,
-                                   select_on=args.select_on)
+                                   select_on=args.select_on,
+                                   batch_size=args.batch_size)
             else:
                 m = MILClassifier(arm, in_dim, hidden[arm], n_classes,
                                   regions_per_batch=args.regions_per_batch,
@@ -551,7 +588,8 @@ def main():
                                    0.01, s, device=args.device,
                                    class_weight=class_weight,
                                    patience=args.patience,
-                                   select_on=args.select_on)
+                                   select_on=args.select_on,
+                                   batch_size=args.batch_size)
             scores.append(r[:2])
             el = time.time() - t_arm
             # stop@ far below the cap means patience bound, not --epochs
@@ -620,6 +658,7 @@ def main():
                 # recorded because it is a design decision, not a nuisance
                 # parameter: it sets how much reach the star baseline gets
                 "star_layers": args.star_layers,
+                "batch_size": args.batch_size,
                 "blend_families": bool(args.blend_families),
                 "arms": list(args.arms),
                 "n_test_mean": n_te,
