@@ -67,10 +67,11 @@ HIDDEN="${HIDDEN:-}"
 REGION_DIM="${REGION_DIM:-}"
 ATT_DIM="${ATT_DIM:-}"
 # abundance skip: a DIFFERENT experiment (does structure add given
-# composition), not a fix to the default one. AB_DROP guards against the
-# easy feature starving the encoder of gradient.
+# composition), not a fix to the default one. PATH_DROP zeroes one path at
+# random each step -- SYMMETRIC, or the graph-zeroed ablation is measuring
+# distribution shift rather than information loss.
 AB_SKIP="${AB_SKIP:-}"
-AB_DROP="${AB_DROP:-}"
+PATH_DROP="${PATH_DROP:-}"
 # empty = train_patterns.py's DEFAULT_ARMS. arm@agg picks the aggregation layer;
 # the cache is keyed by construction only.
 #     ARMS="pw-knn hg-knn hg-radius"        ARMS="pw-knn hg-knn hg-knn@sum"

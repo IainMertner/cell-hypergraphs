@@ -368,11 +368,12 @@ def main():
                          "at-least-abundance and topology can only add. A "
                          "DIFFERENT experiment from the default, not a fix to "
                          "it: it asks whether structure adds given composition")
-    ap.add_argument("--abundance-dropout", type=float, default=0.5,
-                    help="probability of zeroing the abundance vector per "
-                         "sample during training. Without it the easy feature "
-                         "starves the encoder of gradient and a null means "
-                         "'never tried' rather than 'nothing there'")
+    ap.add_argument("--path-dropout", type=float, default=0.25,
+                    help="per training step, zero the abundance path with this "
+                         "probability and the graph path with the same, "
+                         "mutually exclusively. Stops the easy feature starving "
+                         "the encoder, and makes BOTH ablations "
+                         "in-distribution. Max 0.5")
     ap.add_argument("--region-dim", type=int, default=64,
                     help="width every encoder emits. With --att-dim this sets "
                          "the pool+head cost, which is FIXED regardless of "
@@ -509,7 +510,7 @@ def main():
                                             star_layers=args.star_layers,
                                             region_dim=args.region_dim, att_dim=args.att_dim,
                                             abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
-                                            abundance_dropout=args.abundance_dropout)
+                                            path_dropout=args.path_dropout)
     # reference: the Deep Sets hypergraph at the requested hidden dim
     target = n_params(_mil("hg-knn")(in_dim, args.hidden, n_classes))
     hidden = {}
@@ -529,7 +530,7 @@ def main():
                                      star_layers=args.star_layers,
                                      region_dim=args.region_dim, att_dim=args.att_dim,
                                      abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
-                                     abundance_dropout=args.abundance_dropout)
+                                     path_dropout=args.path_dropout)
                     for a in args.arms}
     shared = {a: n_params(m) - n_params(m.encoder) for a, m in built_models.items()}
     if len(set(shared.values())) != 1:
@@ -619,7 +620,7 @@ def main():
                                   star_layers=args.star_layers,
                                   region_dim=args.region_dim, att_dim=args.att_dim,
                                   abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
-                                  abundance_dropout=args.abundance_dropout)
+                                  path_dropout=args.path_dropout)
                 r = train_eval_mil(m, bags, y, tr, va, te, n_classes, args.epochs,
                                    0.01, s,
                                    abundance=(abund if args.abundance_skip else None),
@@ -708,7 +709,7 @@ def main():
                 # parameter: it sets how much reach the star baseline gets
                 "star_layers": args.star_layers,
                 "abundance_skip": bool(args.abundance_skip),
-                "abundance_dropout": args.abundance_dropout,
+                "path_dropout": args.path_dropout,
                 "ablations": ablations,
                 "batch_size": args.batch_size,
                 "region_dim": args.region_dim,

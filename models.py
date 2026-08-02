@@ -540,7 +540,7 @@ class MILClassifier(nn.Module):
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
                  regions_per_batch=16, blend_families=False, star_layers=4,
                  region_dim=REGION_DIM, att_dim=64,
-                 abundance_dim=0, abundance_dropout=0.5):
+                 abundance_dim=0, path_dropout=0.25):
         super().__init__()
         self.arm = arm
         construction, agg = parse_arm(arm)
@@ -570,8 +570,21 @@ class MILClassifier(nn.Module):
         # topology can only add. Turns "can a graph model beat a composition
         # baseline from scratch" (an optimisation question) into "given
         # composition, does structure add" (the question actually of interest).
+        #
+        # path_dropout zeroes ONE path at random per training step -- abundance
+        # with probability p, the graph vector with probability p, neither
+        # otherwise. It must be SYMMETRIC. Dropping only abundance leaves the
+        # head having never seen a zeroed graph vector, so the graph-zeroed
+        # ablation measures distribution shift rather than information loss and
+        # reads far below the floor. That breaks the one comparison the skip
+        # exists to make: full versus graph-zeroed, within the same model.
+        # Mutually exclusive so at least one path always carries signal.
+        if not 0 <= 2 * path_dropout <= 1:
+            raise ValueError(f"path_dropout={path_dropout}: each path is "
+                             "dropped with this probability and they are "
+                             "mutually exclusive, so it cannot exceed 0.5")
         self.abundance_dim = abundance_dim
-        self.abundance_dropout = abundance_dropout
+        self.path_dropout = path_dropout
         self.head = nn.Linear(self.encoder.out_dim + abundance_dim, n_classes)
 
     def _encode_regions(self, packed):
@@ -599,16 +612,13 @@ class MILClassifier(nn.Module):
         mistaken for pre-packed and fails somewhere unrelated.
 
         abundance: per-slide cell-type fractions, used only when abundance_dim>0.
-        DROPPED at random during training. Without that the easy feature explains
-        most of the variance early, gradients into the encoder shrink, and the
-        graph path never learns -- so a null would mean "the model did not try",
-        not "structure adds nothing". Dropout also makes the ablations below
-        in-distribution: a model never trained without abundance would drop on
-        `drop_abundance` purely from seeing an input it has never seen.
+        Pass None (or drop_graph=True) to run an ablation; see path_dropout for
+        why both ablations are in-distribution.
 
-        drop_graph: zero the pooled slide vector. With abundance dropout in
-        training, the two ablations decompose the model -- what structure
-        carries alone, and what composition carries alone.
+        drop_graph: zero the pooled slide vector, leaving composition only.
+        Together the two ablations decompose the model from one set of weights:
+        full vs graph-zeroed is what structure adds, full vs abundance-zeroed is
+        what composition adds.
         """
         packed = (pack_bag(bag, self.mode, self.rpb)
                   if bag and len(bag[0]) in (2, 3) else bag)
@@ -617,14 +627,22 @@ class MILClassifier(nn.Module):
             slide_vec, att = self.pool(region_vecs)
         else:
             slide_vec, att = region_vecs.mean(dim=0), None
-        if drop_graph:
-            slide_vec = torch.zeros_like(slide_vec)
+
         if self.abundance_dim:
-            a = (slide_vec.new_zeros(self.abundance_dim) if abundance is None
+            drop_a = abundance is None
+            if self.training and self.path_dropout > 0:
+                r = float(torch.rand(()))
+                if r < self.path_dropout:
+                    drop_a = True
+                elif r < 2 * self.path_dropout:
+                    drop_graph = True
+            a = (slide_vec.new_zeros(self.abundance_dim) if drop_a
                  else abundance)
-            if self.training and float(torch.rand(())) < self.abundance_dropout:
-                a = torch.zeros_like(a)
+            if drop_graph:
+                slide_vec = torch.zeros_like(slide_vec)
             slide_vec = torch.cat([slide_vec, a])
+        elif drop_graph:
+            slide_vec = torch.zeros_like(slide_vec)
         return self.head(slide_vec), att
 
 
