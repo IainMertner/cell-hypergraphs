@@ -179,20 +179,27 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         idx = torch.as_tensor(np.asarray(chunk), device=labels_t.device).long()
         return float(class_weight[labels_t[idx]].sum())
 
-    def run(i, drop_abundance=False, drop_graph=False):
+    def run(i, ab_i=None, bag_i=None):
+        """Score slide i. ab_i/bag_i override WHICH slide each input comes from,
+        which is how the permutation ablations are done."""
         if bags is None:                       # the abundance-only control
-            return model(abundance[i])
+            return model(abundance[i if ab_i is None else ab_i])
         # bags[i] is already packed (pack_bag in main) -- move a few large
         # tensors rather than re-packing per call
         bag = [tuple(t.to(device) if torch.is_tensor(t) else t for t in g)
-               for g in bags[i]]
-        a = None if (abundance is None or drop_abundance) else abundance[i]
-        return model(bag, a, drop_graph)[0]
+               for g in bags[i if bag_i is None else bag_i]]
+        a = None if abundance is None else abundance[i if ab_i is None else ab_i]
+        return model(bag, a)[0]
 
     y_np = labels_t.detach().cpu().numpy()
 
-    def preds(idx, **kw):
-        return np.array([int(run(i, **kw).argmax()) for i in idx])
+    def preds(idx, src=None, what=None):
+        """src: parallel array of slides to take `what` ('ab'|'bag') from."""
+        if src is None:
+            return np.array([int(run(i).argmax()) for i in idx])
+        kw = "ab_i" if what == "ab" else "bag_i"
+        return np.array([int(run(i, **{kw: j}).argmax())
+                         for i, j in zip(idx, src)])
 
     # Snapshot best-val weights and score test once at the end -- same result as
     # re-scoring test on every improvement, ~20% fewer forward passes. Safe
@@ -237,14 +244,27 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         # macro-F1 alongside accuracy makes majority collapse visible
         tp = preds(te)
         acc, f1 = float((tp == y_np[te]).mean()), macro_f1(tp, y_np[te], n_classes)
-        # Decompose the model. Only meaningful with abundance dropout in
-        # training, which is what makes these inputs in-distribution.
+        # PERMUTATION ablations, not zeroing.
+        #
+        # Zeroing a path measures which branch won the optimisation, not what
+        # its input carries: both feed one head, so whichever gets more training
+        # pressure captures it and the other atrophies. Measured on synthetic
+        # data where abundance IS the signal, the same two numbers went
+        # 0.907/0.178 at path_dropout=0.1 and 0.102/0.979 at 0.5 -- swinging
+        # from one extreme to the other on a parameter with no principled value.
+        #
+        # Permuting feeds a VALID input from the wrong slide. Same marginal
+        # distribution, association destroyed, so nothing is out-of-distribution
+        # and nothing depends on training dynamics. The drop from `full` is how
+        # much the trained model relied on that input.
         abl = {}
-        if bags is not None and getattr(model, "abundance_dim", 0):
-            pa = preds(te, drop_abundance=True)
-            pg = preds(te, drop_graph=True)
-            abl = {"f1_structure_only": macro_f1(pa, y_np[te], n_classes),
-                   "f1_abundance_only": macro_f1(pg, y_np[te], n_classes)}
+        if bags is not None:
+            pr = np.asarray(te)[rng.permutation(len(te))]
+            if getattr(model, "abundance_dim", 0):
+                pa = preds(te, src=pr, what="ab")
+                abl["f1_abundance_permuted"] = macro_f1(pa, y_np[te], n_classes)
+            pg = preds(te, src=pr, what="bag")
+            abl["f1_graph_permuted"] = macro_f1(pg, y_np[te], n_classes)
         return acc, f1, stopped_at, best_epoch, abl
 
 
@@ -368,12 +388,12 @@ def main():
                          "at-least-abundance and topology can only add. A "
                          "DIFFERENT experiment from the default, not a fix to "
                          "it: it asks whether structure adds given composition")
-    ap.add_argument("--path-dropout", type=float, default=0.25,
-                    help="per training step, zero the abundance path with this "
-                         "probability and the graph path with the same, "
-                         "mutually exclusively. Stops the easy feature starving "
-                         "the encoder, and makes BOTH ablations "
-                         "in-distribution. Max 0.5")
+    ap.add_argument("--path-dropout", type=float, default=0.0,
+                    help="per training step, zero one path at random with "
+                         "this probability each. OFF by default -- the "
+                         "permutation ablations need no such training, and the "
+                         "dropout drives a winner-take-all through the shared "
+                         "head that swings the ablations wildly. Max 0.5")
     ap.add_argument("--region-dim", type=int, default=64,
                     help="width every encoder emits. With --att-dim this sets "
                          "the pool+head cost, which is FIXED regardless of "
@@ -642,13 +662,17 @@ def main():
                   flush=True)
         a = np.array(scores)                      # (n_runs, 2) = acc, macro-F1
         if abls:
-            print(f"    [{arm}] ablations: structure-only "
-                  f"{np.mean([d['f1_structure_only'] for d in abls]):.3f} | "
-                  f"abundance-only "
-                  f"{np.mean([d['f1_abundance_only'] for d in abls]):.3f} | "
-                  f"full {a[:, 1].mean():.3f}", flush=True)
-            ablations[arm] = {k: float(np.mean([d[k] for d in abls]))
-                              for k in abls[0]}
+            m = {k: float(np.mean([d[k] for d in abls])) for k in abls[0]}
+            full = a[:, 1].mean()
+            bits = [f"full {full:.3f}"]
+            if "f1_graph_permuted" in m:
+                bits.append(f"graph permuted {m['f1_graph_permuted']:.3f} "
+                            f"(-{full - m['f1_graph_permuted']:.3f})")
+            if "f1_abundance_permuted" in m:
+                bits.append(f"abundance permuted {m['f1_abundance_permuted']:.3f} "
+                            f"(-{full - m['f1_abundance_permuted']:.3f})")
+            print(f"    [{arm}] " + " | ".join(bits), flush=True)
+            ablations[arm] = dict(m, f1_full=float(full))
         return a[:, 0], a[:, 1]
 
     ablations = {}

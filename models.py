@@ -540,7 +540,7 @@ class MILClassifier(nn.Module):
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
                  regions_per_batch=16, blend_families=False, star_layers=4,
                  region_dim=REGION_DIM, att_dim=64,
-                 abundance_dim=0, path_dropout=0.25):
+                 abundance_dim=0, path_dropout=0.25, abundance_hidden=32):
         super().__init__()
         self.arm = arm
         construction, agg = parse_arm(arm)
@@ -579,13 +579,28 @@ class MILClassifier(nn.Module):
         # reads far below the floor. That breaks the one comparison the skip
         # exists to make: full versus graph-zeroed, within the same model.
         # Mutually exclusive so at least one path always carries signal.
+        #
+        # The abundance branch gets its OWN hidden layer, matching AbundanceOnly
+        # (Linear -> ReLU -> Linear, where the head is the second Linear).
+        # Feeding the 6 raw fractions straight into the head instead makes the
+        # abundance path linear while the graph path is deep, so `graph-zeroed`
+        # measures a crippled model rather than what composition carries -- and
+        # `full - graph-zeroed` then OVERSTATES structure's contribution, which
+        # is the direction that flatters the hypothesis. Measured on synthetic
+        # data where abundance is near-perfectly predictive: 0.24 linear against
+        # 0.97 for the control.
         if not 0 <= 2 * path_dropout <= 1:
             raise ValueError(f"path_dropout={path_dropout}: each path is "
                              "dropped with this probability and they are "
                              "mutually exclusive, so it cannot exceed 0.5")
         self.abundance_dim = abundance_dim
         self.path_dropout = path_dropout
-        self.head = nn.Linear(self.encoder.out_dim + abundance_dim, n_classes)
+        ab_out = 0
+        if abundance_dim:
+            ab_out = abundance_hidden
+            self.abundance_enc = nn.Sequential(
+                nn.Linear(abundance_dim, ab_out), nn.ReLU())
+        self.head = nn.Linear(self.encoder.out_dim + ab_out, n_classes)
 
     def _encode_regions(self, packed):
         """Encode pre-packed groups to (R, REGION_DIM)."""
@@ -636,8 +651,8 @@ class MILClassifier(nn.Module):
                     drop_a = True
                 elif r < 2 * self.path_dropout:
                     drop_graph = True
-            a = (slide_vec.new_zeros(self.abundance_dim) if drop_a
-                 else abundance)
+            a = self.abundance_enc(
+                slide_vec.new_zeros(self.abundance_dim) if drop_a else abundance)
             if drop_graph:
                 slide_vec = torch.zeros_like(slide_vec)
             slide_vec = torch.cat([slide_vec, a])
