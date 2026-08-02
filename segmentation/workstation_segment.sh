@@ -7,8 +7,13 @@
 #     tmux new -s seg
 #     bash cell-hypergraphs/segmentation/workstation_segment.sh /scratch0/imertner/batch.tsv
 #
-# batch.tsv is "uuid filename" per line, from the GDC manifest:
-#     awk 'NR>1 {print $1, $2}' gdc_manifest_brca_dx.txt | tail -60 > batch.tsv
+# batch.tsv is "uuid filename size" per line, from the GDC manifest:
+#     awk 'NR>1 {print $1, $2, $4}' gdc_manifest_brca_dx.txt | tail -60 > batch.tsv
+#
+# The size column is not optional. curl can return 0 having written a TRUNCATED
+# file -- observed: 252MB of a 565MB slide, no error -- and CellViT then dies
+# with "Unsupported or missing image file" 20 minutes later. Every download is
+# checked against the manifest size and retried.
 #
 # Env overrides:
 #   WORK  scratch workspace   default: the directory holding batch.tsv
@@ -45,8 +50,22 @@ echo "keep  $KEEP  (already have $(ls "$KEEP"/*/cells_cache.npz 2>/dev/null | wc
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo
 
+fetch() {   # uuid dest expected_bytes -- resume-and-verify, 3 attempts
+    local uuid="$1" dest="$2" want="$3" got
+    for attempt in 1 2 3; do
+        curl -fsSL --retry 3 --retry-delay 5 -C - \
+             -o "$dest" "https://api.gdc.cancer.gov/data/$uuid"
+        got=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+        [ -n "$want" ] && [ "$want" -gt 0 ] || return 0     # no size to check
+        [ "$got" -eq "$want" ] && return 0
+        echo "  attempt $attempt: got $got of $want bytes, retrying"
+        sleep 5
+    done
+    return 1
+}
+
 DONE=0; SKIP=0; FAIL=0
-while read -r UUID FNAME; do
+while read -r UUID FNAME SIZE; do
     [ -z "${UUID:-}" ] && continue
     [ "$N" -gt 0 ] && [ "$DONE" -ge "$N" ] && { echo "reached N=$N"; break; }
 
@@ -61,11 +80,11 @@ while read -r UUID FNAME; do
     echo "=============================================================="
     echo "[$((DONE + FAIL + 1))] $ID  $(date +%H:%M:%S)"
 
-    if [ ! -f "$SVS" ]; then
-        curl -fsSL -o "$SVS" "https://api.gdc.cancer.gov/data/$UUID" || {
-            echo "  download failed"; FAIL=$((FAIL + 1)); rm -f "$SVS"; continue; }
+    if ! fetch "$UUID" "$SVS" "${SIZE:-0}"; then
+        echo "  download failed after 3 attempts -- skipping"
+        FAIL=$((FAIL + 1)); rm -f "$SVS"; continue
     fi
-    echo "  $(du -h "$SVS" | cut -f1) downloaded, segmenting ..."
+    echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), segmenting ..."
 
     mkdir -p "$OUTDIR"
     if cellvit-inference --model SAM --nuclei_taxonomy pannuke --enforce_amp \
