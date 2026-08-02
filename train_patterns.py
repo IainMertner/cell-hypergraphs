@@ -179,19 +179,20 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         idx = torch.as_tensor(np.asarray(chunk), device=labels_t.device).long()
         return float(class_weight[labels_t[idx]].sum())
 
-    def run(i):
-        if abundance is not None:
+    def run(i, drop_abundance=False, drop_graph=False):
+        if bags is None:                       # the abundance-only control
             return model(abundance[i])
         # bags[i] is already packed (pack_bag in main) -- move a few large
         # tensors rather than re-packing per call
         bag = [tuple(t.to(device) if torch.is_tensor(t) else t for t in g)
                for g in bags[i]]
-        return model(bag)[0]
+        a = None if (abundance is None or drop_abundance) else abundance[i]
+        return model(bag, a, drop_graph)[0]
 
     y_np = labels_t.detach().cpu().numpy()
 
-    def preds(idx):
-        return np.array([int(run(i).argmax()) for i in idx])
+    def preds(idx, **kw):
+        return np.array([int(run(i, **kw).argmax()) for i in idx])
 
     # Snapshot best-val weights and score test once at the end -- same result as
     # re-scoring test on every improvement, ~20% fewer forward passes. Safe
@@ -229,14 +230,22 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
                     break
 
     if best_state is None:                      # never improved on -1.0
-        return 0.0, 0.0, stopped_at, best_epoch
+        return 0.0, 0.0, stopped_at, best_epoch, {}
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
         # macro-F1 alongside accuracy makes majority collapse visible
         tp = preds(te)
-        return (float((tp == y_np[te]).mean()),
-                macro_f1(tp, y_np[te], n_classes), stopped_at, best_epoch)
+        acc, f1 = float((tp == y_np[te]).mean()), macro_f1(tp, y_np[te], n_classes)
+        # Decompose the model. Only meaningful with abundance dropout in
+        # training, which is what makes these inputs in-distribution.
+        abl = {}
+        if bags is not None and getattr(model, "abundance_dim", 0):
+            pa = preds(te, drop_abundance=True)
+            pg = preds(te, drop_graph=True)
+            abl = {"f1_structure_only": macro_f1(pa, y_np[te], n_classes),
+                   "f1_abundance_only": macro_f1(pg, y_np[te], n_classes)}
+        return acc, f1, stopped_at, best_epoch, abl
 
 
 def subsample_cohort(y, patient, target_n, seed=0):
@@ -353,6 +362,17 @@ def main():
                          "slides, for learning curves")
     ap.add_argument("--subsample-seed", type=int, default=0,
                     help="which subsample to draw; vary to average over draws")
+    ap.add_argument("--abundance-skip", action="store_true",
+                    help="concatenate the per-slide cell-type fractions to the "
+                         "pooled slide vector, so the head starts from "
+                         "at-least-abundance and topology can only add. A "
+                         "DIFFERENT experiment from the default, not a fix to "
+                         "it: it asks whether structure adds given composition")
+    ap.add_argument("--abundance-dropout", type=float, default=0.5,
+                    help="probability of zeroing the abundance vector per "
+                         "sample during training. Without it the easy feature "
+                         "starves the encoder of gradient and a null means "
+                         "'never tried' rather than 'nothing there'")
     ap.add_argument("--region-dim", type=int, default=64,
                     help="width every encoder emits. With --att-dim this sets "
                          "the pool+head cost, which is FIXED regardless of "
@@ -487,7 +507,9 @@ def main():
         return lambda i, h, o: MILClassifier(arm_name, i, h, o,
                                             blend_families=args.blend_families,
                                             star_layers=args.star_layers,
-                                            region_dim=args.region_dim, att_dim=args.att_dim)
+                                            region_dim=args.region_dim, att_dim=args.att_dim,
+                                            abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
+                                            abundance_dropout=args.abundance_dropout)
     # reference: the Deep Sets hypergraph at the requested hidden dim
     target = n_params(_mil("hg-knn")(in_dim, args.hidden, n_classes))
     hidden = {}
@@ -505,7 +527,9 @@ def main():
     built_models = {a: MILClassifier(a, in_dim, hidden[a], n_classes,
                                      blend_families=args.blend_families,
                                      star_layers=args.star_layers,
-                                     region_dim=args.region_dim, att_dim=args.att_dim)
+                                     region_dim=args.region_dim, att_dim=args.att_dim,
+                                     abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
+                                     abundance_dropout=args.abundance_dropout)
                     for a in args.arms}
     shared = {a: n_params(m) - n_params(m.encoder) for a, m in built_models.items()}
     if len(set(shared.values())) != 1:
@@ -557,7 +581,7 @@ def main():
 
     # `runs` is fixed and ordered, so scores line up index-for-index between arms
     def eval_arm(arm):
-        scores = []
+        scores, abls = [], []
         # pack once per arm and reuse across every run and epoch
         if arm == "abundance-only":
             bags = None
@@ -593,14 +617,20 @@ def main():
                                   regions_per_batch=args.regions_per_batch,
                                   blend_families=args.blend_families,
                                   star_layers=args.star_layers,
-                                  region_dim=args.region_dim, att_dim=args.att_dim)
+                                  region_dim=args.region_dim, att_dim=args.att_dim,
+                                  abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
+                                  abundance_dropout=args.abundance_dropout)
                 r = train_eval_mil(m, bags, y, tr, va, te, n_classes, args.epochs,
-                                   0.01, s, device=args.device,
+                                   0.01, s,
+                                   abundance=(abund if args.abundance_skip else None),
+                                   device=args.device,
                                    class_weight=class_weight,
                                    patience=args.patience,
                                    select_on=args.select_on,
                                    batch_size=args.batch_size)
             scores.append(r[:2])
+            if r[4]:
+                abls.append(r[4])
             el = time.time() - t_arm
             # stop@ far below the cap means patience bound, not --epochs
             cap = "CAP" if r[2] >= args.epochs else "patience"
@@ -610,8 +640,17 @@ def main():
                   f"{el / j:.0f}s/run | eta {(len(runs) - j) * el / j / 60:.0f}min",
                   flush=True)
         a = np.array(scores)                      # (n_runs, 2) = acc, macro-F1
+        if abls:
+            print(f"    [{arm}] ablations: structure-only "
+                  f"{np.mean([d['f1_structure_only'] for d in abls]):.3f} | "
+                  f"abundance-only "
+                  f"{np.mean([d['f1_abundance_only'] for d in abls]):.3f} | "
+                  f"full {a[:, 1].mean():.3f}", flush=True)
+            ablations[arm] = {k: float(np.mean([d[k] for d in abls]))
+                              for k in abls[0]}
         return a[:, 0], a[:, 1]
 
+    ablations = {}
     maj = float((y == y.bincount().argmax()).float().mean())
     n_te = float(np.mean([len(te) for _, _, _, te in runs]))
     n_tr = float(np.mean([len(tr) for _, tr, _, _ in runs]))
@@ -668,6 +707,9 @@ def main():
                 # recorded because it is a design decision, not a nuisance
                 # parameter: it sets how much reach the star baseline gets
                 "star_layers": args.star_layers,
+                "abundance_skip": bool(args.abundance_skip),
+                "abundance_dropout": args.abundance_dropout,
+                "ablations": ablations,
                 "batch_size": args.batch_size,
                 "region_dim": args.region_dim,
                 "att_dim": args.att_dim,

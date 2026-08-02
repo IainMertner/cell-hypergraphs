@@ -66,6 +66,11 @@ STAR_LAYERS="${STAR_LAYERS:-}"     # @star depth; 4 matches a 2-layer hypergraph
 HIDDEN="${HIDDEN:-}"
 REGION_DIM="${REGION_DIM:-}"
 ATT_DIM="${ATT_DIM:-}"
+# abundance skip: a DIFFERENT experiment (does structure add given
+# composition), not a fix to the default one. AB_DROP guards against the
+# easy feature starving the encoder of gradient.
+AB_SKIP="${AB_SKIP:-}"
+AB_DROP="${AB_DROP:-}"
 # empty = train_patterns.py's DEFAULT_ARMS. arm@agg picks the aggregation layer;
 # the cache is keyed by construction only.
 #     ARMS="pw-knn hg-knn hg-radius"        ARMS="pw-knn hg-knn hg-knn@sum"
@@ -98,6 +103,8 @@ python -u train_patterns.py \
     ${HIDDEN:+--hidden $HIDDEN} \
     ${REGION_DIM:+--region-dim $REGION_DIM} \
     ${ATT_DIM:+--att-dim $ATT_DIM} \
+    ${AB_SKIP:+--abundance-skip} \
+    ${AB_DROP:+--abundance-dropout $AB_DROP} \
     $SUBSAMPLE \
     --save-results "$OUT_DIR/${RESULT_NAME}.json"
 

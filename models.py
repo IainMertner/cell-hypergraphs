@@ -539,7 +539,8 @@ class MILClassifier(nn.Module):
 
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
                  regions_per_batch=16, blend_families=False, star_layers=4,
-                 region_dim=REGION_DIM, att_dim=64):
+                 region_dim=REGION_DIM, att_dim=64,
+                 abundance_dim=0, abundance_dropout=0.5):
         super().__init__()
         self.arm = arm
         construction, agg = parse_arm(arm)
@@ -564,7 +565,14 @@ class MILClassifier(nn.Module):
         self.rpb = regions_per_batch
         if pool == "attention":
             self.pool = AttentionMIL(self.encoder.out_dim, att_dim)
-        self.head = nn.Linear(self.encoder.out_dim, n_classes)
+        # Abundance skip: concatenate the per-slide cell-type fractions to the
+        # pooled slide vector, so the head starts from at-least-abundance and
+        # topology can only add. Turns "can a graph model beat a composition
+        # baseline from scratch" (an optimisation question) into "given
+        # composition, does structure add" (the question actually of interest).
+        self.abundance_dim = abundance_dim
+        self.abundance_dropout = abundance_dropout
+        self.head = nn.Linear(self.encoder.out_dim + abundance_dim, n_classes)
 
     def _encode_regions(self, packed):
         """Encode pre-packed groups to (R, REGION_DIM)."""
@@ -581,7 +589,7 @@ class MILClassifier(nn.Module):
                 vecs.append(self.encoder(x, hi, batch, R, n_he, fam))
         return torch.cat(vecs, dim=0)          # attached: gradients flow through all groups
 
-    def forward(self, bag):
+    def forward(self, bag, abundance=None, drop_graph=False):
         """bag: raw regions, or pre-packed groups from pack_bag(). Prefer
         pre-packed -- packing here repeats identical work on every epoch.
 
@@ -589,6 +597,18 @@ class MILClassifier(nn.Module):
         arms; packed groups are 4-tuples (pairwise) or 5-tuples (hypergraph).
         The arity test must accept BOTH raw widths or a 3-tuple region list gets
         mistaken for pre-packed and fails somewhere unrelated.
+
+        abundance: per-slide cell-type fractions, used only when abundance_dim>0.
+        DROPPED at random during training. Without that the easy feature explains
+        most of the variance early, gradients into the encoder shrink, and the
+        graph path never learns -- so a null would mean "the model did not try",
+        not "structure adds nothing". Dropout also makes the ablations below
+        in-distribution: a model never trained without abundance would drop on
+        `drop_abundance` purely from seeing an input it has never seen.
+
+        drop_graph: zero the pooled slide vector. With abundance dropout in
+        training, the two ablations decompose the model -- what structure
+        carries alone, and what composition carries alone.
         """
         packed = (pack_bag(bag, self.mode, self.rpb)
                   if bag and len(bag[0]) in (2, 3) else bag)
@@ -597,6 +617,14 @@ class MILClassifier(nn.Module):
             slide_vec, att = self.pool(region_vecs)
         else:
             slide_vec, att = region_vecs.mean(dim=0), None
+        if drop_graph:
+            slide_vec = torch.zeros_like(slide_vec)
+        if self.abundance_dim:
+            a = (slide_vec.new_zeros(self.abundance_dim) if abundance is None
+                 else abundance)
+            if self.training and float(torch.rand(())) < self.abundance_dropout:
+                a = torch.zeros_like(a)
+            slide_vec = torch.cat([slide_vec, a])
         return self.head(slide_vec), att
 
 
