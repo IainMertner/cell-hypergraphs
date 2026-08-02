@@ -353,6 +353,13 @@ def main():
                          "slides, for learning curves")
     ap.add_argument("--subsample-seed", type=int, default=0,
                     help="which subsample to draw; vary to average over draws")
+    ap.add_argument("--region-dim", type=int, default=64,
+                    help="width every encoder emits. With --att-dim this sets "
+                         "the pool+head cost, which is FIXED regardless of "
+                         "--hidden and is ~80%% of the model once hidden is 8. "
+                         "This is the real capacity knob at small n")
+    ap.add_argument("--att-dim", type=int, default=64,
+                    help="attention hidden width; see --region-dim")
     ap.add_argument("--batch-size", type=int, default=8,
                     help="slides per optimiser step. Was full-batch, which made "
                          "an epoch ONE step and left every run stopping on "
@@ -479,7 +486,8 @@ def main():
     def _mil(arm_name):
         return lambda i, h, o: MILClassifier(arm_name, i, h, o,
                                             blend_families=args.blend_families,
-                                            star_layers=args.star_layers)
+                                            star_layers=args.star_layers,
+                                            region_dim=args.region_dim, att_dim=args.att_dim)
     # reference: the Deep Sets hypergraph at the requested hidden dim
     target = n_params(_mil("hg-knn")(in_dim, args.hidden, n_classes))
     hidden = {}
@@ -496,7 +504,8 @@ def main():
     # later change to att_dim or the readout cannot silently undo that
     built_models = {a: MILClassifier(a, in_dim, hidden[a], n_classes,
                                      blend_families=args.blend_families,
-                                     star_layers=args.star_layers)
+                                     star_layers=args.star_layers,
+                                     region_dim=args.region_dim, att_dim=args.att_dim)
                     for a in args.arms}
     shared = {a: n_params(m) - n_params(m.encoder) for a, m in built_models.items()}
     if len(set(shared.values())) != 1:
@@ -583,7 +592,8 @@ def main():
                 m = MILClassifier(arm, in_dim, hidden[arm], n_classes,
                                   regions_per_batch=args.regions_per_batch,
                                   blend_families=args.blend_families,
-                                  star_layers=args.star_layers)
+                                  star_layers=args.star_layers,
+                                  region_dim=args.region_dim, att_dim=args.att_dim)
                 r = train_eval_mil(m, bags, y, tr, va, te, n_classes, args.epochs,
                                    0.01, s, device=args.device,
                                    class_weight=class_weight,
@@ -659,6 +669,8 @@ def main():
                 # parameter: it sets how much reach the star baseline gets
                 "star_layers": args.star_layers,
                 "batch_size": args.batch_size,
+                "region_dim": args.region_dim,
+                "att_dim": args.att_dim,
                 "blend_families": bool(args.blend_families),
                 "arms": list(args.arms),
                 "n_test_mean": n_te,

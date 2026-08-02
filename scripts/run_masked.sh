@@ -18,8 +18,8 @@
 #$ -l h_rt=0:20:0
 #$ -l mem=8G
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
-#$ -o /home/ucabim3/Scratch/logs/masked.out
-#$ -e /home/ucabim3/Scratch/logs/masked.err
+#$ -o /home/ucabim3/Scratch/logs/masked.$JOB_ID.out
+#$ -e /home/ucabim3/Scratch/logs/masked.$JOB_ID.err
 
 ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/env.sh
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }

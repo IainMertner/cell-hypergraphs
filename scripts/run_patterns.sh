@@ -22,8 +22,8 @@
 #$ -l mem=48G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
-#$ -o /home/ucabim3/Scratch/logs/patterns.out
-#$ -e /home/ucabim3/Scratch/logs/patterns.err
+#$ -o /home/ucabim3/Scratch/logs/patterns.$JOB_ID.out
+#$ -e /home/ucabim3/Scratch/logs/patterns.$JOB_ID.err
 
 ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/env.sh
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }

@@ -15,8 +15,8 @@
 #$ -l mem=8G
 #$ -pe smp 4
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
-#$ -o /home/ucabim3/Scratch/logs/patterns_fast.out
-#$ -e /home/ucabim3/Scratch/logs/patterns_fast.err
+#$ -o /home/ucabim3/Scratch/logs/patterns_fast.$JOB_ID.out
+#$ -e /home/ucabim3/Scratch/logs/patterns_fast.$JOB_ID.err
 
 ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/env.sh
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }

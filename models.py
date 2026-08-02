@@ -522,9 +522,15 @@ class AttentionMIL(nn.Module):
 class MILClassifier(nn.Module):
     """Region encoder (minibatched) + attention pool + linear head. One per arm.
 
-    Pool and head are sized from encoder.out_dim, which REGION_DIM pins, so the
+    Pool and head are sized from encoder.out_dim, which region_dim pins, so the
     encoder is the only thing that differs in parameter count across arms.
     train_patterns.py asserts this at startup.
+
+    region_dim and att_dim are the REAL capacity knob, not `hidden`. The pool and
+    head cost 2*region_dim*att_dim + ... regardless of hidden, which at the
+    defaults is 8,645 parameters -- 80% of the whole model once hidden drops to
+    8. Shrinking `hidden` alone cannot take total capacity below ~9,700, so on
+    ~73 training slides it is tuning a fifth of the model.
 
     Regions are encoded in groups of `regions_per_batch`: full-slide batching
     OOMs on large slides with high-cardinality hypergraphs. Whole regions per
@@ -532,7 +538,8 @@ class MILClassifier(nn.Module):
     """
 
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
-                 regions_per_batch=16, blend_families=False, star_layers=4):
+                 regions_per_batch=16, blend_families=False, star_layers=4,
+                 region_dim=REGION_DIM, att_dim=64):
         super().__init__()
         self.arm = arm
         construction, agg = parse_arm(arm)
@@ -545,17 +552,18 @@ class MILClassifier(nn.Module):
         nf = 1 if blend_families else n_families(arm)
         self.mode = pack_mode(arm)
         if self.mode == "pw":
-            self.encoder = PairwiseRegionEncoder(in_dim, hidden, agg=agg)
+            self.encoder = PairwiseRegionEncoder(in_dim, hidden, region_dim,
+                                                 agg=agg)
         elif self.mode == "star":
-            self.encoder = StarRegionEncoder(in_dim, hidden,
+            self.encoder = StarRegionEncoder(in_dim, hidden, region_dim,
                                              n_layers=star_layers)
         else:
-            self.encoder = HyperRegionEncoder(in_dim, hidden, agg=agg,
-                                              n_families=nf)
+            self.encoder = HyperRegionEncoder(in_dim, hidden, region_dim,
+                                              agg=agg, n_families=nf)
         self.pool_kind = pool
         self.rpb = regions_per_batch
         if pool == "attention":
-            self.pool = AttentionMIL(self.encoder.out_dim)
+            self.pool = AttentionMIL(self.encoder.out_dim, att_dim)
         self.head = nn.Linear(self.encoder.out_dim, n_classes)
 
     def _encode_regions(self, packed):

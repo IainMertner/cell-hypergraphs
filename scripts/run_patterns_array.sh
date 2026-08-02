@@ -21,8 +21,11 @@
 #$ -l mem=48G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
-#$ -o /home/ucabim3/Scratch/logs/pat_seed.$TASK_ID.out
-#$ -e /home/ucabim3/Scratch/logs/pat_seed.$TASK_ID.err
+# $JOB_ID as well as $TASK_ID: without it, task 1 of every pat_seed job
+# overwrites task 1 of the last one, and you cannot tell which sweep a log
+# belongs to after the fact
+#$ -o /home/ucabim3/Scratch/logs/pat_seed.$JOB_ID.$TASK_ID.out
+#$ -e /home/ucabim3/Scratch/logs/pat_seed.$JOB_ID.$TASK_ID.err
 
 ENV_SH=/home/ucabim3/Scratch/cell-hypergraphs/env.sh
 [ -f "$ENV_SH" ] || { echo "FATAL: missing $ENV_SH" >&2; exit 1; }
@@ -58,6 +61,11 @@ RPB="${RPB:-16}"
 RESULT_TAG="${RESULT_TAG:-}"
 BLEND="${BLEND:-}"                # set to 1 for the family-blending ablation
 STAR_LAYERS="${STAR_LAYERS:-}"     # @star depth; 4 matches a 2-layer hypergraph arm
+# capacity knobs. HIDDEN sizes the encoder; REGION_DIM/ATT_DIM size the
+# pool+head, which HIDDEN does not touch at all
+HIDDEN="${HIDDEN:-}"
+REGION_DIM="${REGION_DIM:-}"
+ATT_DIM="${ATT_DIM:-}"
 # empty = train_patterns.py's DEFAULT_ARMS. arm@agg picks the aggregation layer;
 # the cache is keyed by construction only.
 #     ARMS="pw-knn hg-knn hg-radius"        ARMS="pw-knn hg-knn hg-knn@sum"
@@ -87,6 +95,9 @@ python -u train_patterns.py \
     ${ARMS:+--arms $ARMS} \
     ${BLEND:+--blend-families} \
     ${STAR_LAYERS:+--star-layers $STAR_LAYERS} \
+    ${HIDDEN:+--hidden $HIDDEN} \
+    ${REGION_DIM:+--region-dim $REGION_DIM} \
+    ${ATT_DIM:+--att-dim $ATT_DIM} \
     $SUBSAMPLE \
     --save-results "$OUT_DIR/${RESULT_NAME}.json"
 
