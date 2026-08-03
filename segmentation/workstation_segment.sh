@@ -74,6 +74,10 @@ while read -r UUID FNAME SIZE; do
     if [ -f "$KEEP/$ID/cells_cache.npz" ]; then
         SKIP=$((SKIP + 1)); continue
     fi
+    # already known to lack MPP -- do not re-download it on every restart
+    if [ -f "$KEEP/no_mpp.txt" ] && grep -qxF "$ID" "$KEEP/no_mpp.txt"; then
+        SKIP=$((SKIP + 1)); continue
+    fi
 
     SVS="$WORK/slides/$FNAME"
     OUTDIR="$WORK/out/$ID"
