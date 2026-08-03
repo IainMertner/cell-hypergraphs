@@ -19,6 +19,8 @@
 #   WORK  scratch workspace   default: the directory holding batch.tsv
 #   KEEP  where .npz files go default: $HOME/cellvit_out
 #   N     stop after N slides default: 0 (all)
+#   RAY_WORKER   Ray pool size; needed on machines with few cores
+#   BATCH_SIZE   patch batch; lower on cards with <16GB (default 8)
 #
 # /scratch0 IS WIPED WHEN THE RESERVATION ENDS, so each .npz is copied to KEEP
 # the moment it is written. A crash then costs the slide in flight, not the run.
@@ -36,6 +38,13 @@ BATCH=$(readlink -f "$BATCH")
 WORK="${WORK:-$(dirname "$BATCH")}"
 KEEP="${KEEP:-$HOME/cellvit_out}"
 N="${N:-0}"
+# CellViT sizes its Ray pool as int(available_cpus / ray_remote_cpus) and
+# reserves 2 cores, so on a 6-core machine it floors to zero and dies with
+# ZeroDivisionError. RAY_WORKER overrides it. Keep it <= cpu_count-2:
+# overwrite_ray_worker recomputes ray_remote_cpus = (cpu_count-2)/ray_worker,
+# and a larger value floors to zero again.
+RAY_WORKER="${RAY_WORKER:-}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 CACHE_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cache_cells.py"
 
 command -v cellvit-inference >/dev/null 2>&1 || {
@@ -101,8 +110,8 @@ while read -r UUID FNAME SIZE; do
     echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), mpp $MPP, segmenting ..."
 
     mkdir -p "$OUTDIR"
-    if cellvit-inference --model SAM --nuclei_taxonomy pannuke --enforce_amp \
-            --batch_size 8 --geojson --outdir "$OUTDIR" \
+    if cellvit-inference ${RAY_WORKER:+--ray_worker "$RAY_WORKER"} --model SAM --nuclei_taxonomy pannuke --enforce_amp \
+            --batch_size "$BATCH_SIZE" --geojson --outdir "$OUTDIR" \
             process_wsi --wsi_path "$SVS" >"$OUTDIR/cellvit.log" 2>&1 \
        && python "$CACHE_PY" "$OUTDIR" >>"$OUTDIR/cellvit.log" 2>&1
     then
