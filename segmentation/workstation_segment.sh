@@ -101,13 +101,18 @@ while read -r UUID FNAME SIZE; do
     # Aperio header carries neither MPP nor magnification, CellViT then fails
     # anyway, and guessing 40x would silently rescale every micron-denominated
     # parameter for that slide.
-    MPP=$(python "$(dirname "$CACHE_PY")/check_mpp.py" "$SVS" 2>/dev/null)
-    if [ -z "$MPP" ]; then
+    META=$(python "$(dirname "$CACHE_PY")/check_mpp.py" "$SVS" 2>/dev/null)
+    if [ -z "$META" ]; then
         echo "  SKIPPED: no usable MPP in slide metadata"
         echo "$ID" >> "$KEEP/no_mpp.txt"
         SKIP=$((SKIP + 1)); rm -f "$SVS"; continue
     fi
-    echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), mpp $MPP, segmenting ..."
+    # Runtime tracks PIXEL COUNT, not file size -- J2K compression varies by an
+    # order of magnitude, so a 51MB file held 696MP while a 565MB one held less.
+    # Logged per slide because it is the only thing that predicts how long a
+    # slide will take.
+    MPP=${META% *}; MP=${META#* }
+    echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), mpp $MPP, ${MP}MP, segmenting ..."
 
     mkdir -p "$OUTDIR"
     if cellvit-inference ${RAY_WORKER:+--ray_worker "$RAY_WORKER"} --model SAM --nuclei_taxonomy pannuke --enforce_amp \

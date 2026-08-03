@@ -60,7 +60,11 @@ def main():
     if not 0.05 <= mpp <= 2.0:
         print(f"IMPLAUSIBLE MPP {mpp} from {why}", file=sys.stderr)
         return 1
-    print(f"{mpp:.4f}")
+    w, h = openslide.OpenSlide(sys.argv[1]).dimensions
+    # mpp and megapixels on one line: runtime tracks PIXEL COUNT, and file size
+    # is a useless proxy for it -- J2K compression ratios vary by an order of
+    # magnitude, so a 51MB file can hold 696MP while a 565MB one holds less
+    print(f"{mpp:.4f} {w * h / 1e6:.0f}")
     return 0
 
 
