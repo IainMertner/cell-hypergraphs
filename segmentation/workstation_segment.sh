@@ -84,7 +84,17 @@ while read -r UUID FNAME SIZE; do
         echo "  download failed after 3 attempts -- skipping"
         FAIL=$((FAIL + 1)); rm -f "$SVS"; continue
     fi
-    echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), segmenting ..."
+    # Reject slides with no usable MPP BEFORE spending GPU time. A truncated
+    # Aperio header carries neither MPP nor magnification, CellViT then fails
+    # anyway, and guessing 40x would silently rescale every micron-denominated
+    # parameter for that slide.
+    MPP=$(python "$(dirname "$CACHE_PY")/check_mpp.py" "$SVS" 2>/dev/null)
+    if [ -z "$MPP" ]; then
+        echo "  SKIPPED: no usable MPP in slide metadata"
+        echo "$ID" >> "$KEEP/no_mpp.txt"
+        SKIP=$((SKIP + 1)); rm -f "$SVS"; continue
+    fi
+    echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), mpp $MPP, segmenting ..."
 
     mkdir -p "$OUTDIR"
     if cellvit-inference --model SAM --nuclei_taxonomy pannuke --enforce_amp \
@@ -110,4 +120,5 @@ done < "$BATCH"
 echo
 echo "=== segmented $DONE | skipped $SKIP | failed $FAIL ==="
 echo "$(ls "$KEEP"/*/cells_cache.npz 2>/dev/null | wc -l) caches in $KEEP"
+[ -s "$KEEP/no_mpp.txt" ] && echo "$(wc -l < "$KEEP/no_mpp.txt") slide(s) skipped for missing MPP -- listed in $KEEP/no_mpp.txt"
 echo "COPY $KEEP TO MYRIAD BEFORE THE RESERVATION ENDS"
