@@ -10,6 +10,10 @@
 #     qsub -t 1-3 scripts/run_patterns_array.sh
 #     python combine_results.py ~/Scratch/results/
 #
+# A different target needs no re-precompute -- the graph cache is label-free:
+#     qsub -t 1-5 -v TASK=auto,LABELS=~/Scratch/er_labels.csv,LABEL_COL=label,\
+#     RESULT_TAG=er scripts/run_patterns_array.sh
+#
 # LEARNING CURVE: set SIZES and the task index selects a cohort size instead of
 # a seed. Each point gets its own cohort fingerprint, so combine_results.py
 # refuses to pool them -- read them separately.
@@ -57,6 +61,12 @@ EPOCHS="${EPOCHS:-150}"
 PATIENCE="${PATIENCE:-$(( EPOCHS / 10 > 20 ? EPOCHS / 10 : 20 ))}"
 FOLDS="${FOLDS:-5}"
 TASK="${TASK:-pattern4}"
+# Any categorical slide-level column: TASK=auto reads LABEL_COL from LABELS.
+# Build the CSV with make_labels.py, which joins a patient-level clinical
+# table onto the segmented slides and reports the class balance first.
+LABELS="${LABELS:-/home/ucabim3/Scratch/til_indices.csv}"
+LABEL_COL="${LABEL_COL:-}"
+MIN_CLASS="${MIN_CLASS:-}"
 RPB="${RPB:-16}"
 RESULT_TAG="${RESULT_TAG:-}"
 BLEND="${BLEND:-}"                # set to 1 for the family-blending ablation
@@ -80,18 +90,22 @@ ARMS="${ARMS:-}"
 echo "=== $(date) on $(hostname) ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
     || echo "WARNING: no GPU visible -- this will not finish in the walltime"
-echo "task $SGE_TASK_ID -> SEED $SEED | task=$TASK folds=$FOLDS" \
+echo "task $SGE_TASK_ID -> SEED $SEED | task=$TASK${LABEL_COL:+ col=$LABEL_COL} folds=$FOLDS" \
      "epochs=$EPOCHS patience=$PATIENCE arms=${ARMS:-<default>}"
+echo "labels: $LABELS"
 
 # RESULT_TAG keeps a different configuration in its own directory
 OUT_DIR="$RESULTS${RESULT_TAG:+/$RESULT_TAG}"
 mkdir -p "$OUT_DIR"
-RESULT_NAME="${TASK}_seed${SEED}"
-[ -n "$SUBSAMPLE" ] && RESULT_NAME="${TASK}_n${SIZE_ARR[$(( SGE_TASK_ID - 1 ))]}_seed${SEED}"
+# TASK=auto is the same string for every custom label, so fold LABEL_COL
+# into the filename or two different targets overwrite each other
+NAME_TAG="$TASK${LABEL_COL:+_$LABEL_COL}"
+RESULT_NAME="${NAME_TAG}_seed${SEED}"
+[ -n "$SUBSAMPLE" ] && RESULT_NAME="${NAME_TAG}_n${SIZE_ARR[$(( SGE_TASK_ID - 1 ))]}_seed${SEED}"
 
 python -u train_patterns.py \
     --graph-cache /home/ucabim3/Scratch/graph_cache \
-    --labels /home/ucabim3/Scratch/til_indices.csv \
+    --labels "$LABELS" \
     --task "$TASK" \
     --regions-per-batch "$RPB" \
     --epochs "$EPOCHS" \
@@ -99,6 +113,8 @@ python -u train_patterns.py \
     --folds "$FOLDS" \
     --seed "$SEED" \
     ${ARMS:+--arms $ARMS} \
+    ${LABEL_COL:+--label-col "$LABEL_COL"} \
+    ${MIN_CLASS:+--min-class $MIN_CLASS} \
     ${BLEND:+--blend-families} \
     ${STAR_LAYERS:+--star-layers $STAR_LAYERS} \
     ${HIDDEN:+--hidden $HIDDEN} \
