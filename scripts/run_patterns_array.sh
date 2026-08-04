@@ -95,6 +95,14 @@ PATH_DROP="${PATH_DROP:-}"
 ARMS="${ARMS:-}"
 
 echo "=== $(date) on $(hostname) ==="
+
+# torch sizes its thread pool from the machine's core count, not from what SGE
+# reserved. Ten 1-slot array tasks on one node then spawn a full pool each and
+# thrash -- the same run is several times slower than when it lands alone.
+# NSLOTS is what we actually hold.
+export OMP_NUM_THREADS="${NSLOTS:-1}"
+export MKL_NUM_THREADS="${NSLOTS:-1}"
+echo "threads $OMP_NUM_THREADS (NSLOTS=${NSLOTS:-unset})"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
     || echo "CPU only"
 echo "task $SGE_TASK_ID -> SEED $SEED | task=$TASK${LABEL_COL:+ col=$LABEL_COL} folds=$FOLDS" \

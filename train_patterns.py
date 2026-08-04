@@ -474,12 +474,21 @@ def main():
     files = [f for f in sorted(glob.glob(os.path.join(args.graph_cache, "*.pt")))
              if not f.endswith("_params.pt")]
     slide_bags, slide_abund, y, patient, slide_ids = [], [], [], [], []
-    for f in files:
+    # 253 torch.load calls off a shared filesystem is minutes of silence,
+    # and it looks identical to a hang. Report the rate as it goes.
+    needed = {parse_arm(a)[0] for a in args.arms}
+    t_load = time.time()
+    print(f"loading {len(files)} slides from the graph cache ...", flush=True)
+    for _i, f in enumerate(files, 1):
         sid = os.path.basename(f)[:-3]
         if sid not in labels:
             continue
         slide_ids.append(sid)
         d = torch.load(f)
+        if _i % 25 == 0 or _i == len(files):
+            _el = time.time() - t_load
+            print(f"  {_i}/{len(files)} slides | {_el:.0f}s "
+                  f"({_el / _i:.2f}s/slide)", flush=True)
         # each slide carries the params it was built under; disagreement with the
         # manifest means the cache spans a parameter change
         stale = {k: (d.get("params", {}).get(k, "<missing>"), v)
@@ -495,7 +504,11 @@ def main():
         if missing:
             raise ValueError(f"{f} lacks arm(s) {missing}; rerun "
                              f"precompute_graphs.py --arms {' '.join(missing)}")
-        slide_bags.append(d["bags"])
+        # keep only the constructions this run uses. The cache holds every
+        # arm ever precomputed and all of it stays resident otherwise --
+        # 253 slides x 4 constructions is a lot of RAM for nothing.
+        slide_bags.append({k: v for k, v in d["bags"].items()
+                           if k in needed})
         slide_abund.append(d["abundance"])
         y.append(labels[sid])
         # TCGA-XX-YYYY; a patient's slides must share a fold (no leakage)
