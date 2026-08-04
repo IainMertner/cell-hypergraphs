@@ -62,6 +62,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results_dir")
     ap.add_argument("--glob", default="*.json")
+    ap.add_argument("--baseline", default="abundance-only",
+                    help="arm every other arm is tested against. Default is "
+                         "the triviality control; name a pairwise arm for the "
+                         "hypergraph-vs-pairwise comparison. Run once per "
+                         "question rather than printing every pair -- each "
+                         "test is another comparison you have to report")
     args = ap.parse_args()
 
     paths = glob.glob(os.path.join(args.results_dir, args.glob))
@@ -88,22 +94,28 @@ def main():
     n_te = float(np.mean([r["n_test"] for d in parts for r in d["runs"]]))
     n_tr = float(np.mean([d["n_train_mean"] for d in parts]))
 
-    ab, ab_f1 = stack("abundance-only", "acc"), stack("abundance-only", "f1")
+    base = args.baseline
+    known = ["abundance-only"] + list(ref["arms"])
+    if base not in known:
+        raise SystemExit(f"--baseline {base!r} not in this run: {known}")
+    ab, ab_f1 = stack(base, "acc"), stack(base, "f1")
     print(f"=== test scores over {len(seeds)} seeds x {ref['folds']} folds "
           f"({n_runs} runs/arm) ===")
     print(f"  {'majority baseline':<18} acc {ref['majority_baseline']:.3f}")
-    print(f"  {'abundance-only':<18} acc {ab.mean():.3f} +- {ab.std():.3f}"
+    print(f"  {base:<18} acc {ab.mean():.3f} +- {ab.std():.3f}"
           f" | macroF1 {ab_f1.mean():.3f}")
     print(f"  {'':<18} {'':<4}(the bar every arm below must clear)\n")
 
     for arm in ref["arms"]:
+        if arm == base:
+            continue
         sc, f1 = stack(arm, "acc"), stack(arm, "f1")
         beat = float((sc > ab).mean())
         mean_d, _t, p = corrected_t_test(sc - ab, n_te, n_tr)
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
         print(f"  {arm:<18} acc {sc.mean():.3f} +- {sc.std():.3f}"
               f" | macroF1 {f1.mean():.3f}")
-        print(f"  {'':<18} vs abundance {mean_d:+.3f} ({sig}, corrected) "
+        print(f"  {'':<18} vs {base} {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
 
     # Ablations are per-part means, so average across parts. Reported because the
@@ -128,7 +140,7 @@ def main():
             print(f"  {arm:<28} full {full:.3f} | " + " | ".join(bits))
         print("  a drop near zero means that input was not being used")
 
-    print("\nabundance-only is the bar; the majority baseline is the floor.")
+    print(f"\n{base} is the bar; the majority baseline is the floor.")
     print("  - macroF1 near floor with respectable acc = collapsed to majority")
     print("  - the +- is a spread, not a standard error: repeated-CV runs share")
     print("    training data, which is what the corrected p accounts for")
