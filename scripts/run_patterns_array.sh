@@ -26,7 +26,10 @@
 # full-batch. A 48G single-slot request is harder for the scheduler to
 # place than the GPU, and jobs sat unqueued for hours because of it.
 #$ -l mem=16G
-#$ -l gpu=1
+# No GPU. Capacity-matched models are ~10^4 parameters over a few thousand nodes
+# per region, which a CPU handles in minutes -- but a gpu=1 request queued for
+# hours to days behind real GPU work. The wait dwarfed the runtime.
+# Add -l gpu=1 on the command line if a sweep ever outgrows this.
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
 # $JOB_ID as well as $TASK_ID: without it, task 1 of every pat_seed job
 # overwrites task 1 of the last one, and you cannot tell which sweep a log
@@ -92,8 +95,8 @@ PATH_DROP="${PATH_DROP:-}"
 ARMS="${ARMS:-}"
 
 echo "=== $(date) on $(hostname) ==="
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
-    || echo "WARNING: no GPU visible -- this will not finish in the walltime"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
+    || echo "CPU only"
 echo "task $SGE_TASK_ID -> SEED $SEED | task=$TASK${LABEL_COL:+ col=$LABEL_COL} folds=$FOLDS" \
      "epochs=$EPOCHS patience=$PATIENCE arms=${ARMS:-<default>}"
 echo "labels: $LABELS"

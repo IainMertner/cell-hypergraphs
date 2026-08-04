@@ -23,7 +23,10 @@
 # full-batch. A 48G single-slot request is harder for the scheduler to
 # place than the GPU, and jobs sat unqueued for hours because of it.
 #$ -l mem=16G
-#$ -l gpu=1
+# No GPU. Capacity-matched models are ~10^4 parameters over a few thousand
+# nodes per region, which a CPU handles in minutes -- but a gpu=1 request
+# queued for hours to days behind real GPU work: the wait dwarfed the run.
+# Add -l gpu=1 on the command line if a sweep ever outgrows this.
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
 #$ -o /home/ucabim3/Scratch/logs/patterns.$JOB_ID.out
 #$ -e /home/ucabim3/Scratch/logs/patterns.$JOB_ID.err
@@ -35,8 +38,8 @@ python -c "import torch" 2>/dev/null || {
     echo "FATAL: torch not importable after sourcing $ENV_SH" >&2; exit 1; }
 mkdir -p /home/ucabim3/Scratch/logs
 echo "=== $(date) on $(hostname) ==="
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
-    || echo "WARNING: no GPU visible -- this will not finish in the walltime"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
+    || echo "CPU only"
 
 SEEDS="${SEEDS:-10}"
 EPOCHS="${EPOCHS:-150}"
