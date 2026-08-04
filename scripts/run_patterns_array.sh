@@ -22,7 +22,10 @@
 
 #$ -N pat_seed
 #$ -l h_rt=1:0:0
-#$ -l mem=48G
+# 16G not 48G: 48 was set when regions-per-batch was 16 and training was
+# full-batch. A 48G single-slot request is harder for the scheduler to
+# place than the GPU, and jobs sat unqueued for hours because of it.
+#$ -l mem=16G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
 # $JOB_ID as well as $TASK_ID: without it, task 1 of every pat_seed job

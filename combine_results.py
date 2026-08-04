@@ -106,6 +106,28 @@ def main():
         print(f"  {'':<18} vs abundance {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
 
+    # Ablations are per-part means, so average across parts. Reported because the
+    # headline score cannot distinguish "structure adds nothing" from "the model
+    # never used the graph".
+    abl = {}
+    for d in parts:
+        for arm, m in (d.get("ablations") or {}).items():
+            for k, v in m.items():
+                abl.setdefault(arm, {}).setdefault(k, []).append(v)
+    if abl:
+        print("\npermutation ablations -- the drop from full is how much the "
+              "trained\nmodel relied on that input:")
+        for arm, m in abl.items():
+            full = float(np.mean(m.get("f1_full", [float("nan")])))
+            bits = []
+            for key, lbl in (("f1_graph_permuted", "graph"),
+                             ("f1_abundance_permuted", "abundance")):
+                if key in m:
+                    v = float(np.mean(m[key]))
+                    bits.append(f"{lbl} permuted {v:.3f} ({v - full:+.3f})")
+            print(f"  {arm:<28} full {full:.3f} | " + " | ".join(bits))
+        print("  a drop near zero means that input was not being used")
+
     print("\nabundance-only is the bar; the majority baseline is the floor.")
     print("  - macroF1 near floor with respectable acc = collapsed to majority")
     print("  - the +- is a spread, not a standard error: repeated-CV runs share")

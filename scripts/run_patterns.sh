@@ -19,7 +19,10 @@
 
 #$ -N patterns
 #$ -l h_rt=12:0:0
-#$ -l mem=48G
+# 16G not 48G: 48 was set when regions-per-batch was 16 and training was
+# full-batch. A 48G single-slot request is harder for the scheduler to
+# place than the GPU, and jobs sat unqueued for hours because of it.
+#$ -l mem=16G
 #$ -l gpu=1
 #$ -wd /home/ucabim3/Scratch/cell-hypergraphs
 #$ -o /home/ucabim3/Scratch/logs/patterns.$JOB_ID.out
