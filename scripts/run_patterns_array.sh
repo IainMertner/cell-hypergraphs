@@ -130,6 +130,7 @@ python -u train_patterns.py \
     ${ATT_DIM:+--att-dim $ATT_DIM} \
     ${AB_SKIP:+--abundance-skip} \
     ${AB_DROP:+--abundance-dropout $AB_DROP} \
+    ${PROGRESS:+--progress-every $PROGRESS} \
     $SUBSAMPLE \
     --save-results "$OUT_DIR/${RESULT_NAME}.json"
 

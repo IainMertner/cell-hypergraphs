@@ -127,7 +127,8 @@ def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
 
 def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, seed,
                    abundance=None, device="cpu", patience=20, class_weight=None,
-                   select_on="macro_f1", batch_size=8):
+                   select_on="macro_f1", batch_size=8, progress_every=0,
+                   tag=""):
     """Train on `tr`, early-stop on `va`, score `te`. Returns (accuracy, macro-F1).
 
     batch_size: slides per optimiser step. This was FULL BATCH -- gradients
@@ -209,6 +210,7 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     rng = np.random.default_rng(seed)          # own stream, so shuffling cannot
     tr = np.asarray(tr)                        # perturb model init reproducibly
     bs = len(tr) if batch_size <= 0 else min(batch_size, len(tr))
+    t_ep = time.time()
     for ep in range(1, epochs + 1):
         model.train()
         order = tr[rng.permutation(len(tr))]
@@ -235,6 +237,13 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
                 if since >= patience:
                     stopped_at = ep
                     break
+        # A graph arm can spend 15 minutes inside one fold. Without this the log
+        # is silent for that whole time and a wedged run looks like a slow one.
+        if progress_every and (ep % progress_every == 0 or ep == 1):
+            el = time.time() - t_ep
+            print(f"      {tag}ep {ep:>4}/{epochs} val={score:.3f} "
+                  f"best={best_val:.3f}@{best_epoch} since={since:>2}/{patience} "
+                  f"| {el / ep:.1f}s/ep {el / 60:.0f}m elapsed", flush=True)
 
     if best_state is None:                      # never improved on -1.0
         return 0.0, 0.0, stopped_at, best_epoch, {}
@@ -409,6 +418,11 @@ def main():
                     default="macro_f1",
                     help="early-stopping metric; acc rewards majority collapse "
                          "when classes are imbalanced, macro_f1 does not")
+    ap.add_argument("--progress-every", type=int, default=10,
+                    help="print a line every N epochs inside a run. 0 is "
+                         "silent-until-done, which is what it used to be "
+                         "-- fine for abundance-only at 2s/run, useless "
+                         "for a graph arm at 15min/run")
     ap.add_argument("--patience", type=int, default=20,
                     help="epochs without val improvement before stopping. Must "
                          "scale with --epochs: an epoch is one optimiser step, "
@@ -533,7 +547,7 @@ def main():
         return lambda i, h, o: MILClassifier(arm_name, i, h, o,
                                             blend_families=args.blend_families,
                                             star_layers=args.star_layers,
-                                            pw_layers=args.pw_layers,
+                                  pw_layers=args.pw_layers,
                                             region_dim=args.region_dim, att_dim=args.att_dim,
                                             abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                             path_dropout=args.path_dropout)
@@ -554,7 +568,7 @@ def main():
     built_models = {a: MILClassifier(a, in_dim, hidden[a], n_classes,
                                      blend_families=args.blend_families,
                                      star_layers=args.star_layers,
-                                            pw_layers=args.pw_layers,
+                                  pw_layers=args.pw_layers,
                                      region_dim=args.region_dim, att_dim=args.att_dim,
                                      abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                      path_dropout=args.path_dropout)
@@ -639,13 +653,15 @@ def main():
                                    device=args.device, class_weight=class_weight,
                                    patience=args.patience,
                                    select_on=args.select_on,
-                                   batch_size=args.batch_size)
+                                   batch_size=args.batch_size,
+                                   progress_every=args.progress_every,
+                                   tag=f"[{arm}] {j}/{len(runs)} ")
             else:
                 m = MILClassifier(arm, in_dim, hidden[arm], n_classes,
                                   regions_per_batch=args.regions_per_batch,
                                   blend_families=args.blend_families,
                                   star_layers=args.star_layers,
-                                            pw_layers=args.pw_layers,
+                                  pw_layers=args.pw_layers,
                                   region_dim=args.region_dim, att_dim=args.att_dim,
                                   abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                   path_dropout=args.path_dropout)
@@ -656,7 +672,9 @@ def main():
                                    class_weight=class_weight,
                                    patience=args.patience,
                                    select_on=args.select_on,
-                                   batch_size=args.batch_size)
+                                   batch_size=args.batch_size,
+                                   progress_every=args.progress_every,
+                                   tag=f"[{arm}] {j}/{len(runs)} ")
             scores.append(r[:2])
             if r[4]:
                 abls.append(r[4])
