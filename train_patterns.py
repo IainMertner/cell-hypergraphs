@@ -421,6 +421,11 @@ def main():
     ap.add_argument("--save-results", default=None,
                     help="write per-run scores + cohort fingerprint to this "
                          "JSON path, for combine_results.py")
+    ap.add_argument("--pw-layers", type=int, default=2,
+                    help="depth of pairwise encoders. A hypergraph layer covers "
+                         "two hops, so 4 here matches a 2-layer hypergraph arm's "
+                         "reach; sweep it to measure the exchange rate between "
+                         "hyperedge encoding and depth")
     ap.add_argument("--star-layers", type=int, default=4,
                     help="depth of @star arms. 4 reach-matches a 2-layer "
                          "hypergraph arm (one hypergraph layer = two star hops) "
@@ -528,6 +533,7 @@ def main():
         return lambda i, h, o: MILClassifier(arm_name, i, h, o,
                                             blend_families=args.blend_families,
                                             star_layers=args.star_layers,
+                                            pw_layers=args.pw_layers,
                                             region_dim=args.region_dim, att_dim=args.att_dim,
                                             abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                             path_dropout=args.path_dropout)
@@ -548,6 +554,7 @@ def main():
     built_models = {a: MILClassifier(a, in_dim, hidden[a], n_classes,
                                      blend_families=args.blend_families,
                                      star_layers=args.star_layers,
+                                            pw_layers=args.pw_layers,
                                      region_dim=args.region_dim, att_dim=args.att_dim,
                                      abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                      path_dropout=args.path_dropout)
@@ -638,6 +645,7 @@ def main():
                                   regions_per_batch=args.regions_per_batch,
                                   blend_families=args.blend_families,
                                   star_layers=args.star_layers,
+                                            pw_layers=args.pw_layers,
                                   region_dim=args.region_dim, att_dim=args.att_dim,
                                   abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                   path_dropout=args.path_dropout)
@@ -732,6 +740,7 @@ def main():
                 # recorded because it is a design decision, not a nuisance
                 # parameter: it sets how much reach the star baseline gets
                 "star_layers": args.star_layers,
+                "pw_layers": args.pw_layers,
                 "abundance_skip": bool(args.abundance_skip),
                 "path_dropout": args.path_dropout,
                 "ablations": ablations,

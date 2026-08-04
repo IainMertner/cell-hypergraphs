@@ -247,6 +247,12 @@ class PairwiseRegionEncoder(nn.Module):
     agg="gin+deg" GIN with log1p(deg) concatenated. Twin of DeepSetsHyperConv
                   WITH its size channel. Isolates explicit cardinality.
 
+    n_layers sets the receptive field: each layer is one hop. A hypergraph layer
+    over neighbourhood hyperedges covers TWO hops (node -> hyperedge -> node), so
+    a 2-layer hypergraph arm reaches as far as a 4-layer pairwise one. Varying
+    this measures the exchange rate between hyperedge encoding and depth -- what
+    the hyperedge buys, not whether it won fairly.
+
     Without these the aggregation function was confounded with the construction:
     every pw arm normalised, every hg arm summed, so "hypergraphs win" and "sum
     beats normalisation" (Xu et al., GIN) were not separable.
@@ -257,22 +263,26 @@ class PairwiseRegionEncoder(nn.Module):
             "gin": GINLayer,
             "gin+deg": partial(GINLayer, use_degree=True)}
 
-    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None):
+    def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None, n_layers=2):
         super().__init__()
         agg = agg or "gcn"
         if agg not in self.AGGS:
             raise ValueError(f"unknown pairwise agg {agg!r}; expected one of "
                              f"{sorted(self.AGGS)}")
+        if n_layers < 1:
+            raise ValueError(f"n_layers={n_layers}: need at least one")
         Conv = self.AGGS[agg]
         self.agg = agg
-        self.c1 = Conv(in_dim, hidden)
-        self.c2 = Conv(hidden, hidden)
+        self.n_layers = n_layers
+        dims = [in_dim] + [hidden] * n_layers
+        self.convs = nn.ModuleList([Conv(dims[i], dims[i + 1])
+                                    for i in range(n_layers)])
         self.proj = nn.Linear(3 * hidden, out_dim)
         self.out_dim = out_dim
 
     def forward(self, x, edge_index, batch, n_regions):
-        x = F.relu(self.c1(x, edge_index))
-        x = F.relu(self.c2(x, edge_index))
+        for c in self.convs:
+            x = F.relu(c(x, edge_index))
         return self.proj(_readout(x, batch, n_regions))
 
 
@@ -540,7 +550,8 @@ class MILClassifier(nn.Module):
     def __init__(self, arm, in_dim, hidden, n_classes, pool="attention",
                  regions_per_batch=16, blend_families=False, star_layers=4,
                  region_dim=REGION_DIM, att_dim=64,
-                 abundance_dim=0, path_dropout=0.25, abundance_hidden=32):
+                 abundance_dim=0, path_dropout=0.25, abundance_hidden=32,
+                 pw_layers=2):
         super().__init__()
         self.arm = arm
         construction, agg = parse_arm(arm)
@@ -554,7 +565,7 @@ class MILClassifier(nn.Module):
         self.mode = pack_mode(arm)
         if self.mode == "pw":
             self.encoder = PairwiseRegionEncoder(in_dim, hidden, region_dim,
-                                                 agg=agg)
+                                                 agg=agg, n_layers=pw_layers)
         elif self.mode == "star":
             self.encoder = StarRegionEncoder(in_dim, hidden, region_dim,
                                              n_layers=star_layers)

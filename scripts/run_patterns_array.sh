@@ -73,7 +73,8 @@ MIN_CLASS="${MIN_CLASS:-}"
 RPB="${RPB:-16}"
 RESULT_TAG="${RESULT_TAG:-}"
 BLEND="${BLEND:-}"                # set to 1 for the family-blending ablation
-STAR_LAYERS="${STAR_LAYERS:-}"     # @star depth; 4 matches a 2-layer hypergraph arm
+STAR_LAYERS="${STAR_LAYERS:-}"
+PW_LAYERS="${PW_LAYERS:-}"          # pairwise depth; 4 reach-matches a hypergraph arm     # @star depth; 4 matches a 2-layer hypergraph arm
 # capacity knobs. HIDDEN sizes the encoder; REGION_DIM/ATT_DIM size the
 # pool+head, which HIDDEN does not touch at all
 HIDDEN="${HIDDEN:-}"
@@ -120,6 +121,7 @@ python -u train_patterns.py \
     ${MIN_CLASS:+--min-class $MIN_CLASS} \
     ${BLEND:+--blend-families} \
     ${STAR_LAYERS:+--star-layers $STAR_LAYERS} \
+    ${PW_LAYERS:+--pw-layers $PW_LAYERS} \
     ${HIDDEN:+--hidden $HIDDEN} \
     ${REGION_DIM:+--region-dim $REGION_DIM} \
     ${ATT_DIM:+--att-dim $ATT_DIM} \
