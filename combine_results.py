@@ -68,6 +68,11 @@ def main():
                          "hypergraph-vs-pairwise comparison. Run once per "
                          "question rather than printing every pair -- each "
                          "test is another comparison you have to report")
+    ap.add_argument("--save", default=None,
+                    help="write the merged numbers to this JSON. The per-seed "
+                         "files remain the record; this is the aggregate a "
+                         "table or a slide is built from, so it does not have "
+                         "to be re-derived by re-running this command")
     args = ap.parse_args()
 
     paths = glob.glob(os.path.join(args.results_dir, args.glob))
@@ -99,6 +104,14 @@ def main():
     if base not in known:
         raise SystemExit(f"--baseline {base!r} not in this run: {known}")
     ab, ab_f1 = stack(base, "acc"), stack(base, "f1")
+    summary = {k: ref.get(k) for k in
+               ("cohort", "n_slides", "n_patients", "task", "classes",
+                "class_counts", "folds", "epochs", "majority_baseline")}
+    summary.update(baseline=base, seeds=seeds, n_runs=n_runs,
+                   n_test_mean=n_te, n_train_mean=n_tr, arms={}, ablations={})
+    summary["arms"][base] = dict(
+        acc=float(ab.mean()), acc_sd=float(ab.std()),
+        f1=float(ab_f1.mean()), f1_sd=float(ab_f1.std()))
     print(f"=== test scores over {len(seeds)} seeds x {ref['folds']} folds "
           f"({n_runs} runs/arm) ===")
     print(f"  {'majority baseline':<18} acc {ref['majority_baseline']:.3f}")
@@ -117,6 +130,11 @@ def main():
               f" | macroF1 {f1.mean():.3f}")
         print(f"  {'':<18} vs {base} {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
+        summary["arms"][arm] = dict(
+            acc=float(sc.mean()), acc_sd=float(sc.std()),
+            f1=float(f1.mean()), f1_sd=float(f1.std()),
+            delta_vs_baseline=float(mean_d), win_rate=float(beat),
+            p_corrected=None if np.isnan(p) else float(p))
 
     # Ablations are per-part means, so average across parts. Reported because the
     # headline score cannot distinguish "structure adds nothing" from "the model
@@ -138,8 +156,30 @@ def main():
                     v = float(np.mean(m[key]))
                     bits.append(f"{lbl} permuted {v:.3f} ({v - full:+.3f})")
             print(f"  {arm:<28} full {full:.3f} | " + " | ".join(bits))
+            summary["ablations"][arm] = dict(
+                full=full,
+                **{lbl: float(np.mean(m[key]))
+                   for key, lbl in (("f1_graph_permuted", "graph_permuted"),
+                                    ("f1_abundance_permuted",
+                                     "abundance_permuted")) if key in m})
         print("  a drop near zero means that input was not being used")
 
+    if args.save:
+        # A combined file from a different cohort is a different experiment.
+        # Silently replacing one with the other is how a slide ends up quoting
+        # numbers from a slide set that no longer exists.
+        if os.path.exists(args.save):
+            with open(args.save) as fh:
+                old = json.load(fh)
+            if old.get("cohort") != summary["cohort"]:
+                raise SystemExit(
+                    f"REFUSING TO OVERWRITE {args.save}: it holds cohort "
+                    f"{old.get('cohort')}, this run is {summary['cohort']}. "
+                    "Write to a different path.")
+        with open(args.save, "w") as fh:
+            json.dump(summary, fh, indent=2)
+        print("")
+        print(f"wrote {args.save} (baseline {base})")
     print(f"\n{base} is the bar; the majority baseline is the floor.")
     print("  - macroF1 near floor with respectable acc = collapsed to majority")
     print("  - the +- is a spread, not a standard error: repeated-CV runs share")

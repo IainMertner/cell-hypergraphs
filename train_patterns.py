@@ -704,12 +704,15 @@ def main():
             m = {k: float(np.mean([d[k] for d in abls])) for k in abls[0]}
             full = a[:, 1].mean()
             bits = [f"full {full:.3f}"]
+            # signed delta, not a literal "-" in front of an already-signed
+            # number: permuting an unused input can IMPROVE the score, which
+            # printed as (--0.018) before.
             if "f1_graph_permuted" in m:
-                bits.append(f"graph permuted {m['f1_graph_permuted']:.3f} "
-                            f"(-{full - m['f1_graph_permuted']:.3f})")
+                v = m["f1_graph_permuted"]
+                bits.append(f"graph permuted {v:.3f} ({v - full:+.3f})")
             if "f1_abundance_permuted" in m:
-                bits.append(f"abundance permuted {m['f1_abundance_permuted']:.3f} "
-                            f"(-{full - m['f1_abundance_permuted']:.3f})")
+                v = m["f1_abundance_permuted"]
+                bits.append(f"abundance permuted {v:.3f} ({v - full:+.3f})")
             print(f"    [{arm}] " + " | ".join(bits), flush=True)
             ablations[arm] = dict(m, f1_full=float(full))
         return a[:, 0], a[:, 1]
