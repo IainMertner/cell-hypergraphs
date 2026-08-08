@@ -25,7 +25,9 @@ ME=$(basename "$HOME")
 [ -n "$ME" ] && [ "$ME" != "/" ] || {
     echo "FATAL: could not derive a username from HOME=$HOME" >&2; exit 1; }
 
-ROOT="/scratch0/$ME"
+# /scratch0 is the CS workstations' local disk. Anywhere else -- a WSL2 box,
+# a lab machine -- set ROOT to somewhere writable that survives a reboot.
+ROOT="${ROOT:-/scratch0/$ME}"
 CONDA="$ROOT/miniconda3"
 ENVDIR="$ROOT/envs/cellvit"
 REPO="$ROOT/cell-hypergraphs"
@@ -37,7 +39,7 @@ step "user $ME | root $ROOT"
 mkdir -p "$ROOT" || { echo "FATAL: cannot write to $ROOT" >&2; exit 1; }
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader \
     || echo "WARNING: no GPU visible"
-df -h /scratch0 | tail -1
+df -h "$ROOT" | tail -1
 
 step "miniconda"
 if [ -x "$CONDA/bin/conda" ]; then
@@ -110,6 +112,25 @@ sys.exit(0 if ok else 1)
 EOF
 VERIFY=$?
 
+
+step "rclone"
+# The CS session cannot resolve its own uid, so ssh/scp/rsync abort before they
+# even dial. rclone speaks SFTP itself and reads $HOME from the environment, so
+# it is the only thing here that can reach Myriad. /scratch0 is wiped between
+# reservations, hence refetching it each time.
+if [ -x "$ROOT/rclone/rclone" ]; then
+    echo "already installed"
+else
+    cd "$ROOT"
+    curl -fsSLO https://downloads.rclone.org/rclone-current-linux-amd64.zip
+    python -c "import zipfile; zipfile.ZipFile('rclone-current-linux-amd64.zip').extractall('.')"
+    mkdir -p "$ROOT/rclone"
+    cp rclone-v*-linux-amd64/rclone "$ROOT/rclone/"
+    chmod +x "$ROOT/rclone/rclone"
+    rm -rf rclone-v*-linux-amd64 rclone-current-linux-amd64.zip
+fi
+"$ROOT/rclone/rclone" version | head -1
+
 step "repo"
 if [ -d "$REPO/.git" ]; then
     git -C "$REPO" pull --ff-only || echo "  (pull failed, keeping what is there)"
@@ -122,6 +143,12 @@ cat > "$ROOT/env.sh" <<EOF
 export USER=$ME
 source $CONDA/etc/profile.d/conda.sh
 conda activate $ENVDIR
+export PATH="$ROOT/rclone:\$PATH"
+export RCLONE_SFTP_HOST=myriad.rc.ucl.ac.uk
+export RCLONE_SFTP_USER=ucabim3
+export RCLONE_SFTP_ASK_PASSWORD=true
+export RCLONE_SFTP_KEY_USE_AGENT=false
+export RCLONE_SFTP_KNOWN_HOSTS_FILE=none
 EOF
 echo "wrote $ROOT/env.sh"
 
