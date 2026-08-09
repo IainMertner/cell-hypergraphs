@@ -37,7 +37,8 @@ if (-not $Work) { $Work = Split-Path $Batch -Parent }
 $here = Split-Path $MyInvocation.MyCommand.Path -Parent
 $cachePy = Join-Path $here "cache_cells.py"
 $mppPy = Join-Path $here "check_mpp.py"
-foreach ($f in @($cachePy, $mppPy)) {
+$launchPy = Join-Path $here "cellvit_launch.py"
+foreach ($f in @($cachePy, $mppPy, $launchPy)) {
     if (-not (Test-Path $f)) { throw "missing $f" }
 }
 if (-not (Get-Command cellvit-inference -ErrorAction SilentlyContinue)) {
@@ -125,9 +126,12 @@ foreach ($row in $rows) {
                "--batch_size", $BatchSize, "--geojson", "--outdir", $outdir,
                "process_wsi", "--wsi_path", $svs)
 
+    # Via cellvit_launch.py, not the cellvit-inference shim: on Windows
+    # torchvision's bundled DLLs shadow GDAL's, and the launcher imports
+    # rasterio first so it binds them before torchvision loads.
     # $LASTEXITCODE, not $?: for a native executable $? reports whether the
     # command was launched, not what it returned.
-    & cellvit-inference @cvArgs *> $log
+    & python $launchPy @cvArgs *> $log
     $ok = ($LASTEXITCODE -eq 0)
     if ($ok) { & python $cachePy $outdir *>> $log; $ok = ($LASTEXITCODE -eq 0) }
 
