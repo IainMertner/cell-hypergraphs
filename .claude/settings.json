@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -)",
+      "Bash(sed -n '/^The unnormalised sum retains/,/### 2.4/p' WRITEUP.md)",
+      "Bash(cd \"C:/Users/iain/dev/cell-hypergraphs\" *)"
+    ]
+  }
+}

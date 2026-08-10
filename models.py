@@ -66,6 +66,15 @@ class DeepSetsHyperConv(nn.Module):
     containing a node and discards node degree; "sum" keeps it. GCNConv retains
     degree via 1/sqrt(d_i d_j), so back="mean" costs the hypergraph arms a
     density signal the pairwise baseline has.
+
+    The node's own representation is combined with the returned hyperedge
+    messages as (1 + eps) * x, matching GIN, rather than being concatenated.
+    Concatenation is strictly more general -- W([b || x]) subsumes W((1+e)x + b)
+    -- and that generality is exactly the problem: it would give the hypergraph
+    arm freedom in combining a cell with its context that the pairwise arm does
+    not have, in a comparison meant to isolate structure alone. rho therefore
+    outputs in INPUT dimension so the addition is well-typed, again as in GIN,
+    where the sum happens in input space and the outer map changes width.
     """
 
     def __init__(self, in_dim, out_dim, hidden=None, back="mean", n_families=1):
@@ -74,12 +83,18 @@ class DeepSetsHyperConv(nn.Module):
         self.back = back
         self.n_families = n_families
         self.hidden = hidden
+        self.in_dim = in_dim
         self.phi = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
         # rho stays SHARED across families -- log1p compresses 5 vs 200 members
         # to 1.8 vs 5.3, which one transform handles. Only the return path has
         # to be separated, because that is where the sum is irreversible.
-        self.rho = nn.Sequential(nn.Linear(hidden + 1, hidden), nn.ReLU())
-        self.out = nn.Linear(hidden * n_families + in_dim, out_dim)
+        self.rho = nn.Sequential(nn.Linear(hidden + 1, in_dim), nn.ReLU())
+        self.eps = nn.Parameter(torch.zeros(1))
+        # Multi-family arms keep one vector per family so `out` can weight them
+        # independently; a single projection back to in_dim restores the width
+        # the addition needs while leaving the families separable inside it.
+        self.proj = nn.Linear(in_dim * n_families, in_dim) if n_families > 1 else None
+        self.out = nn.Linear(in_dim, out_dim)
 
     def forward(self, x, hyperedge_index, num_hyperedges=None, family_id=None):
         node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
@@ -87,9 +102,7 @@ class DeepSetsHyperConv(nn.Module):
         if num_hyperedges is None:
             num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
         if num_hyperedges == 0:                       # degenerate region
-            return self.out(torch.cat(
-                [torch.zeros(n, self.hidden * self.n_families, device=x.device),
-                 x], dim=1))
+            return self.out((1 + self.eps) * x)
         m = self.phi(x)
         he = scatter(m[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
@@ -98,7 +111,9 @@ class DeepSetsHyperConv(nn.Module):
         he = self.rho(torch.cat([he, size.log1p()], dim=1))
         back = _back_by_family(he, node_idx, edge_idx, n, self.back,
                                family_id, self.n_families)
-        return self.out(torch.cat([back, x], dim=1))
+        if self.proj is not None:
+            back = self.proj(back)
+        return self.out((1 + self.eps) * x + back)
 
 class SumHyperConv(nn.Module):
     """Sum-pooling hyperedge layer with ONE linear transform.
