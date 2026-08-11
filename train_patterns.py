@@ -432,6 +432,13 @@ def main():
     ap.add_argument("--seed", type=int, default=None,
                     help="run ONLY this seed (0-based). For splitting a sweep "
                          "across array tasks; merge with combine_results.py")
+    ap.add_argument("--fold", type=int, default=None,
+                    help="run ONLY this fold of each seed (0-based). Splits a "
+                         "sweep k times finer than --seed alone, which matters "
+                         "when a whole seed does not finish in a walltime. "
+                         "Folds are deterministic in (cohort, k, seed), so a "
+                         "fold run alone is bit-identical to the same fold run "
+                         "as part of its seed")
     ap.add_argument("--save-results", default=None,
                     help="write per-run scores + cohort fingerprint to this "
                          "JSON path, for combine_results.py")
@@ -616,13 +623,21 @@ def main():
     seed_list = [args.seed] if args.seed is not None else list(range(args.seeds))
     fold_sets = {s: _make_folds(y.numpy(), patient, args.folds, seed=s)
                  for s in seed_list}
-    runs = [(s, tr, va, te) for s in seed_list for tr, va, te in fold_sets[s]]
+    runs = [(s, f, tr, va, te) for s in seed_list
+            for f, (tr, va, te) in enumerate(fold_sets[s])]
+    if args.fold is not None:
+        if not 0 <= args.fold < args.folds:
+            raise SystemExit(f"--fold {args.fold} out of range for "
+                             f"--folds {args.folds}")
+        runs = [r for r in runs if r[1] == args.fold]
     if args.seed is not None:
         print(f"SEED {args.seed} ONLY -- this is one part of a split sweep; "
               f"merge with combine_results.py")
+    if args.fold is not None:
+        print(f"FOLD {args.fold} ONLY -- {len(runs)} run(s) in this part")
     # An epoch used to be ONE optimiser step, so `epochs` and `patience` meant
     # something very different from what they read like. Print the conversion.
-    n_tr_mean = float(np.mean([len(t) for _, t, _, _ in runs]))
+    n_tr_mean = float(np.mean([len(t) for _, _, t, _, _ in runs]))
     steps = (max(1, int(np.ceil(n_tr_mean / args.batch_size)))
              if args.batch_size > 0 else 1)
     print(f"batch {args.batch_size if args.batch_size > 0 else 'full'} "
@@ -655,7 +670,7 @@ def main():
         # size the next job by
         t_arm = time.time()
         print(f"  [{arm}] {len(runs)} runs ...", flush=True)
-        for j, (s, tr, va, te) in enumerate(runs, 1):
+        for j, (s, fold, tr, va, te) in enumerate(runs, 1):
             # seed before constructing the model, or init depends on whatever
             # RNG state the previous arm left behind
             set_seed(s)
@@ -719,8 +734,8 @@ def main():
 
     ablations = {}
     maj = float((y == y.bincount().argmax()).float().mean())
-    n_te = float(np.mean([len(te) for _, _, _, te in runs]))
-    n_tr = float(np.mean([len(tr) for _, tr, _, _ in runs]))
+    n_te = float(np.mean([len(te) for _, _, _, _, te in runs]))
+    n_tr = float(np.mean([len(tr) for _, _, tr, _, _ in runs]))
 
     # macro-F1 of a majority predictor: 2p/(p+1) on one class, 0 on the rest
     floor_f1 = (2 * maj / (maj + 1)) / n_classes
@@ -787,8 +802,9 @@ def main():
                 "n_train_mean": n_tr,
                 # (seed, fold) order, identical across arms, so scores stay
                 # paired index-for-index after merging
-                "runs": [{"seed": int(s), "n_test": int(len(te))}
-                         for s, _, _, te in runs],
+                "runs": [{"seed": int(s), "fold": int(f),
+                          "n_test": int(len(te))}
+                         for s, f, _, _, te in runs],
                 "scores": per_arm,
             }, fh, indent=2)
         print(f"\nwrote {args.save_results} (cohort {fingerprint})")

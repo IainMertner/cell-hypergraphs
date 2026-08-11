@@ -45,16 +45,22 @@ def check_compatible(parts):
                     + ("  Cohort differs -- the slide set changed between tasks "
                        "(new segmentation?). These are separate experiments and "
                        "cannot be pooled." if k == "cohort" else ""))
+    # A part is identified by the (seed, fold) pairs it actually ran, not by its
+    # seeds: --fold splits one seed across several parts, and keying on the seed
+    # alone would reject that as a duplicate.
     seen = {}
     for d in parts:
-        for s in d["seeds"]:
-            if s in seen:
+        for r in d["runs"]:
+            key = (r["seed"], r.get("fold"))
+            if key in seen:
+                where = "seed {}{}".format(
+                    key[0], "" if key[1] is None else f" fold {key[1]}")
                 raise SystemExit(
-                    f"REFUSING TO MERGE: seed {s} appears in both "
-                    f"{os.path.basename(seen[s])} and "
+                    f"REFUSING TO MERGE: {where} appears in both "
+                    f"{os.path.basename(seen[key])} and "
                     f"{os.path.basename(d['_path'])}. Double-counting runs would "
                     "understate the variance.")
-            seen[s] = d["_path"]
+            seen[key] = d["_path"]
     return ref
 
 
@@ -90,8 +96,14 @@ def main():
     print(f"class counts {ref['class_counts']}")
     print(f"folds={ref['folds']} epochs={ref['epochs']}\n")
 
-    # concatenate in seed order so every arm keeps the same run ordering
-    order = sorted(range(len(parts)), key=lambda i: min(parts[i]["seeds"]))
+    # Concatenate in (seed, fold) order so every arm keeps the same run ordering
+    # and the paired test compares like with like. Ordering by seed alone would
+    # leave fold-split parts of one seed in filesystem order, which differs
+    # between arms only by accident -- and mispaired scores fail silently.
+    def part_key(d):
+        return min((r["seed"], r.get("fold") if r.get("fold") is not None else 0)
+                   for r in d["runs"])
+    order = sorted(range(len(parts)), key=lambda i: part_key(parts[i]))
     def stack(arm, field):
         return np.concatenate([np.array(parts[i]["scores"][arm][field])
                                for i in order])
