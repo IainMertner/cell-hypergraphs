@@ -114,9 +114,11 @@ while read -r UUID FNAME SIZE; do
     MPP=${META% *}; MP=${META#* }
     echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), mpp $MPP, ${MP}MP, segmenting ..."
 
+    # No --geojson: cache_cells.py reads cells.json, and building the geojson
+    # costs GBs of RAM on a large slide for a file nothing downstream reads.
     mkdir -p "$OUTDIR"
     if cellvit-inference ${RAY_WORKER:+--ray_worker "$RAY_WORKER"} --model SAM --nuclei_taxonomy pannuke --enforce_amp \
-            --batch_size "$BATCH_SIZE" --geojson --outdir "$OUTDIR" \
+            --batch_size "$BATCH_SIZE" --outdir "$OUTDIR" \
             process_wsi --wsi_path "$SVS" >"$OUTDIR/cellvit.log" 2>&1 \
        && python "$CACHE_PY" "$OUTDIR" >>"$OUTDIR/cellvit.log" 2>&1
     then

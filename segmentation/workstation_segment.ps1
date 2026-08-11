@@ -118,12 +118,14 @@ foreach ($row in $rows) {
     $mb = [math]::Round((Get-Size $svs) / 1MB)
     Write-Host "  ${mb}MB downloaded (size verified), mpp $mpp, ${mp}MP, segmenting ..."
 
+    # No --geojson: cache_cells.py reads cells.json, and building the geojson
+    # costs GBs of RAM on a large slide for a file nothing downstream reads.
     New-Item -ItemType Directory -Force -Path $outdir | Out-Null
     $log = Join-Path $outdir "cellvit.log"
     $cvArgs = @()
     if ($RayWorker -gt 0) { $cvArgs += @("--ray_worker", $RayWorker) }
     $cvArgs += @("--model", "SAM", "--nuclei_taxonomy", "pannuke", "--enforce_amp",
-               "--batch_size", $BatchSize, "--geojson", "--outdir", $outdir,
+               "--batch_size", $BatchSize, "--outdir", $outdir,
                "process_wsi", "--wsi_path", $svs)
 
     # Via cellvit_launch.py, not the cellvit-inference shim: on Windows
