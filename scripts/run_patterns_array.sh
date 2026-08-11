@@ -46,8 +46,25 @@ python -c "import torch" 2>/dev/null || {
 RESULTS=/home/ucabim3/Scratch/results
 mkdir -p /home/ucabim3/Scratch/logs "$RESULTS"
 
-SEED=$(( SGE_TASK_ID - 1 ))       # SGE tasks are 1-based, seeds 0-based
+# SEED (and FOLD, if splitting) are derived after FOLDS is known -- see below
 
+EPOCHS="${EPOCHS:-150}"
+# patience must scale with the cap: training is full-batch, so an epoch is one
+# optimiser step and patience 20 ends a run around step 40 whatever the cap is
+PATIENCE="${PATIENCE:-$(( EPOCHS / 10 > 20 ? EPOCHS / 10 : 20 ))}"
+FOLDS="${FOLDS:-5}"
+
+# FOLD_SPLIT=1 gives one array task per (seed, fold) rather than per seed,
+# k times more tasks and k times shorter each. Folds are deterministic in
+# (cohort, k, seed), so a fold run alone is the same fold run as part of its
+# seed. Submit -t 1-(seeds*folds).
+if [ -n "${FOLD_SPLIT:-}" ]; then
+    SEED=$(( (SGE_TASK_ID - 1) / FOLDS ))
+    FOLD=$(( (SGE_TASK_ID - 1) % FOLDS ))
+else
+    SEED=$(( SGE_TASK_ID - 1 ))   # SGE tasks are 1-based, seeds 0-based
+    FOLD=""
+fi
 SUBSAMPLE=""
 if [ -n "${SIZES:-}" ]; then
     SIZE_ARR=($SIZES)
@@ -61,11 +78,6 @@ if [ -n "${SIZES:-}" ]; then
     echo "LEARNING CURVE: task $SGE_TASK_ID -> ${SIZE_ARR[$IDX]} slides, seed $SEED"
 fi
 
-EPOCHS="${EPOCHS:-150}"
-# patience must scale with the cap: training is full-batch, so an epoch is one
-# optimiser step and patience 20 ends a run around step 40 whatever the cap is
-PATIENCE="${PATIENCE:-$(( EPOCHS / 10 > 20 ? EPOCHS / 10 : 20 ))}"
-FOLDS="${FOLDS:-5}"
 TASK="${TASK:-pattern4}"
 # Any categorical slide-level column: TASK=auto reads LABEL_COL from LABELS.
 # Build the CSV with make_labels.py, which joins a patient-level clinical
@@ -105,7 +117,7 @@ export MKL_NUM_THREADS="${NSLOTS:-1}"
 echo "threads $OMP_NUM_THREADS (NSLOTS=${NSLOTS:-unset})"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
     || echo "CPU only"
-echo "task $SGE_TASK_ID -> SEED $SEED | task=$TASK${LABEL_COL:+ col=$LABEL_COL} folds=$FOLDS" \
+echo "task $SGE_TASK_ID -> SEED $SEED${FOLD:+ FOLD $FOLD} | task=$TASK${LABEL_COL:+ col=$LABEL_COL} folds=$FOLDS" \
      "epochs=$EPOCHS patience=$PATIENCE arms=${ARMS:-<default>}"
 echo "labels: $LABELS"
 
@@ -115,7 +127,7 @@ mkdir -p "$OUT_DIR"
 # TASK=auto is the same string for every custom label, so fold LABEL_COL
 # into the filename or two different targets overwrite each other
 NAME_TAG="$TASK${LABEL_COL:+_$LABEL_COL}"
-RESULT_NAME="${NAME_TAG}_seed${SEED}"
+RESULT_NAME="${NAME_TAG}_seed${SEED}${FOLD:+_fold${FOLD}}"
 [ -n "$SUBSAMPLE" ] && RESULT_NAME="${NAME_TAG}_n${SIZE_ARR[$(( SGE_TASK_ID - 1 ))]}_seed${SEED}"
 
 python -u train_patterns.py \
@@ -139,6 +151,7 @@ python -u train_patterns.py \
     ${AB_SKIP:+--abundance-skip} \
     ${AB_DROP:+--abundance-dropout $AB_DROP} \
     ${PROGRESS:+--progress-every $PROGRESS} \
+    ${FOLD:+--fold $FOLD} \
     $SUBSAMPLE \
     --save-results "$OUT_DIR/${RESULT_NAME}.json"
 
