@@ -79,6 +79,20 @@ fetch() {   # uuid dest expected_bytes -- resume-and-verify, 3 attempts
     return 1
 }
 
+
+# CellViT runs on Ray, and a slide killed by the OOM reaper leaves its workers
+# and object store behind holding GBs. The NEXT slide then starts with too
+# little memory and fails too, so one oversized slide takes the rest of the
+# batch with it. Reap them between slides -- this is what makes the run safe to
+# leave unattended.
+reap_ray() {
+    ray stop --force >/dev/null 2>&1
+    pkill -u "$(id -u)" -f "ray::"  >/dev/null 2>&1
+    pkill -u "$(id -u)" -f raylet   >/dev/null 2>&1
+    pkill -u "$(id -u)" -f plasma_store >/dev/null 2>&1
+    sleep 3
+}
+
 DONE=0; SKIP=0; FAIL=0
 while read -r UUID FNAME SIZE; do
     [ -z "${UUID:-}" ] && continue
@@ -99,6 +113,9 @@ while read -r UUID FNAME SIZE; do
     echo "=============================================================="
     echo "[$((DONE + FAIL + 1))] $ID  $(date +%H:%M:%S)"
 
+    # curl is silent, so without this there is nothing between the header and
+    # the "downloaded" line for several minutes, which reads as a hang
+    echo "  downloading $(( ${SIZE:-0} / 1000000 ))MB ..."
     if ! fetch "$UUID" "$SVS" "${SIZE:-0}"; then
         echo "  download failed after 3 attempts -- skipping"
         FAIL=$((FAIL + 1)); rm -f "$SVS"; continue
@@ -145,6 +162,8 @@ while read -r UUID FNAME SIZE; do
     fi
 
     rm -rf "$OUTDIR" "$SVS"
+    reap_ray
+    echo "  memory free: $(free -g 2>/dev/null | awk '/^Mem:/{print $7}')GB"
     echo "  done $DONE | failed $FAIL | scratch free $(df -h "$WORK" | tail -1 | awk '{print $4}')"
 done < "$BATCH"
 

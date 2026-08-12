@@ -100,6 +100,9 @@ foreach ($row in $rows) {
     Write-Host "=============================================================="
     Write-Host "[$($done + $fail + 1)] $id  $(Get-Date -Format HH:mm:ss)"
 
+    # Invoke-WebRequest is silent here, so without this there is nothing between
+    # the header and the "downloaded" line for several minutes
+    Write-Host "  downloading $([math]::Round($want / 1MB))MB ..."
     if (-not (Get-Slide $uuid $svs $want)) {
         Write-Host "  download failed after 3 attempts -- skipping"
         $fail++; Remove-Item $svs -Force -ErrorAction SilentlyContinue; continue
