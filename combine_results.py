@@ -87,7 +87,9 @@ def main():
     parts = load_parts(paths)
     ref = check_compatible(parts)
 
-    seeds = sorted(s for d in parts for s in d["seeds"])
+    # dedupe: with --fold, each of a seed's folds is its own part and reports
+    # that seed, so the raw list holds every seed k times
+    seeds = sorted({s for d in parts for s in d["seeds"]})
     n_runs = sum(len(d["runs"]) for d in parts)
     print(f"merged {len(parts)} part(s) | seeds {seeds} | {n_runs} runs/arm")
     print(f"cohort {ref['cohort']} | {ref['n_slides']} slides | "

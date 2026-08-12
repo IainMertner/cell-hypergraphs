@@ -21,6 +21,7 @@
 #   N     stop after N slides default: 0 (all)
 #   RAY_WORKER   Ray pool size; needed on machines with few cores
 #   BATCH_SIZE   patch batch; lower on cards with <16GB (default 8)
+#   MAX_MP       skip slides above this many megapixels (default 0 = no limit)
 #
 # /scratch0 IS WIPED WHEN THE RESERVATION ENDS, so each .npz is copied to KEEP
 # the moment it is written. A crash then costs the slide in flight, not the run.
@@ -45,6 +46,11 @@ N="${N:-0}"
 # and a larger value floors to zero again.
 RAY_WORKER="${RAY_WORKER:-}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
+# CellViT accumulates detected cells for the whole slide in RAM, so peak
+# memory scales with pixel count. On a machine that cannot hold the largest
+# slides, MAX_MP skips them BEFORE the 30-90 minutes it takes to fail, and
+# records them for a machine with more memory.
+MAX_MP="${MAX_MP:-0}"
 CACHE_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cache_cells.py"
 
 command -v cellvit-inference >/dev/null 2>&1 || {
@@ -112,6 +118,11 @@ while read -r UUID FNAME SIZE; do
     # Logged per slide because it is the only thing that predicts how long a
     # slide will take.
     MPP=${META% *}; MP=${META#* }
+    if [ "$MAX_MP" -gt 0 ] && [ "${MP%%.*}" -gt "$MAX_MP" ]; then
+        echo "  SKIPPED: ${MP}MP exceeds MAX_MP=$MAX_MP -- needs more memory than this host"
+        echo "$ID" >> "$KEEP/too_big.txt"
+        SKIP=$((SKIP + 1)); rm -f "$SVS"; continue
+    fi
     echo "  $(du -h "$SVS" | cut -f1) downloaded (size verified), mpp $MPP, ${MP}MP, segmenting ..."
 
     # No --geojson: cache_cells.py reads cells.json, and building the geojson
@@ -140,5 +151,6 @@ done < "$BATCH"
 echo
 echo "=== segmented $DONE | skipped $SKIP | failed $FAIL ==="
 echo "$(ls "$KEEP"/*/cells_cache.npz 2>/dev/null | wc -l) caches in $KEEP"
+[ -s "$KEEP/too_big.txt" ] && echo "$(sort -u "$KEEP/too_big.txt" | wc -l) slide(s) skipped as too large -- listed in $KEEP/too_big.txt"
 [ -s "$KEEP/no_mpp.txt" ] && echo "$(wc -l < "$KEEP/no_mpp.txt") slide(s) skipped for missing MPP -- listed in $KEEP/no_mpp.txt"
 echo "COPY $KEEP TO MYRIAD BEFORE THE RESERVATION ENDS"

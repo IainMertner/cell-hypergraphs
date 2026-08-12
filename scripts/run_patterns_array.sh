@@ -130,6 +130,15 @@ NAME_TAG="$TASK${LABEL_COL:+_$LABEL_COL}"
 RESULT_NAME="${NAME_TAG}_seed${SEED}${FOLD:+_fold${FOLD}}"
 [ -n "$SUBSAMPLE" ] && RESULT_NAME="${NAME_TAG}_n${SIZE_ARR[$(( SGE_TASK_ID - 1 ))]}_seed${SEED}"
 
+# Resumable: a task whose result already exists exits immediately. SGE's -t
+# takes a range, not a list, so re-running the whole array is the only way to
+# retry the handful that died -- node faults and OOM kills both leave gaps.
+# Without this, retrying 15 tasks would recompute the other 35.
+if [ -s "$OUT_DIR/${RESULT_NAME}.json" ]; then
+    echo "already done: $OUT_DIR/${RESULT_NAME}.json -- nothing to do"
+    exit 0
+fi
+
 python -u train_patterns.py \
     --graph-cache /home/ucabim3/Scratch/graph_cache \
     --labels "$LABELS" \
