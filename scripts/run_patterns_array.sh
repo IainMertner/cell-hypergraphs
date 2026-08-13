@@ -105,6 +105,10 @@ PATH_DROP="${PATH_DROP:-}"
 # the cache is keyed by construction only.
 #     ARMS="pw-knn hg-knn hg-radius"        ARMS="pw-knn hg-knn hg-knn@sum"
 ARMS="${ARMS:-}"
+# Which precomputed cache to train against. Region geometry lives in the cache,
+# so pointing at a different one is a different experiment -- the fingerprint
+# hashes cache geometry as well as the slide set and will refuse to pool them.
+GRAPH_CACHE="${GRAPH_CACHE:-/home/ucabim3/Scratch/graph_cache}"
 
 echo "=== $(date) on $(hostname) ==="
 
@@ -120,6 +124,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null \
 echo "task $SGE_TASK_ID -> SEED $SEED${FOLD:+ FOLD $FOLD} | task=$TASK${LABEL_COL:+ col=$LABEL_COL} folds=$FOLDS" \
      "epochs=$EPOCHS patience=$PATIENCE arms=${ARMS:-<default>}"
 echo "labels: $LABELS"
+echo "graph cache: $GRAPH_CACHE"
 
 # RESULT_TAG keeps a different configuration in its own directory
 OUT_DIR="$RESULTS${RESULT_TAG:+/$RESULT_TAG}"
@@ -140,7 +145,7 @@ if [ -s "$OUT_DIR/${RESULT_NAME}.json" ]; then
 fi
 
 python -u train_patterns.py \
-    --graph-cache /home/ucabim3/Scratch/graph_cache \
+    --graph-cache "$GRAPH_CACHE" \
     --labels "$LABELS" \
     --task "$TASK" \
     --regions-per-batch "$RPB" \
