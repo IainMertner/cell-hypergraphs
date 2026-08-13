@@ -58,6 +58,15 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--done", nargs="*", default=[],
                     help="cellvit_out trees whose slides are already segmented")
+    ap.add_argument("--done-list", nargs="*", default=[],
+                    help="files of slide ids, one per line, already segmented. "
+                         "For machines that cannot see the other machines' "
+                         "output: generate with `rclone lsf <remote> -R "
+                         "--include '*/cells_cache.npz' | cut -d/ -f1`")
+    ap.add_argument("--exclude", nargs="*", default=[],
+                    help="batch files (uuid filename size) whose slides another "
+                         "machine has already been given. Excluded whether or "
+                         "not they are finished, so two runs cannot collide")
     ap.add_argument("--limit", type=int, default=0, help="first N only (0 = all)")
     ap.add_argument("--shuffle", type=int, default=None,
                     help="seed; use different seeds on machines running at once")
@@ -84,9 +93,29 @@ def main():
         print(f"  {len(found):>4} already segmented in {d}")
         done |= found
 
+    for path in args.done_list:
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            print(f"  note: {path} is not a file, ignoring")
+            continue
+        ids = {ln.strip() for ln in open(path) if ln.strip()}
+        print(f"  {len(ids):>4} already segmented per {path}")
+        done |= ids
+
+    excluded = set()
+    for path in args.exclude:
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            print(f"  note: {path} is not a file, ignoring")
+            continue
+        ids = {slide_id(ln.split()[1]) for ln in open(path) if ln.strip()}
+        print(f"  {len(ids):>4} assigned elsewhere per {path}")
+        excluded |= ids
+
     rows = [(h["file_id"], h["file_name"], h["file_size"]) for h in hits]
     rows.sort(key=lambda r: slide_id(r[1]))
-    todo = [r for r in rows if slide_id(r[1]) not in done]
+    todo = [r for r in rows
+            if slide_id(r[1]) not in done and slide_id(r[1]) not in excluded]
     if args.shuffle is not None:
         random.Random(args.shuffle).shuffle(todo)
     if args.limit:
@@ -99,6 +128,8 @@ def main():
     gb = sum(r[2] for r in todo) / 1e9
     print(f"\n{len(rows)} diagnostic slides in TCGA-BRCA")
     print(f"{len(done)} already segmented")
+    if excluded:
+        print(f"{len(excluded)} assigned to another machine")
     print(f"wrote {len(todo)} to {args.out} ({gb:.0f}GB to download)")
 
 
