@@ -521,9 +521,10 @@ def main():
         # TCGA-XX-YYYY; a patient's slides must share a fold (no leakage)
         patient.append("-".join(sid.split("-")[:3]))
     n = len(y)
-    # Fingerprint = hash of the exact slide set. While the cohort grows, only
-    # runs sharing a fingerprint are comparable. Subsample first, so each
-    # learning-curve point gets its own identity and cannot be pooled.
+    # Fingerprint = hash of the exact slide set AND the cache geometry. While
+    # the cohort grows, only runs sharing a fingerprint are comparable.
+    # Subsample first, so each learning-curve point gets its own identity and
+    # cannot be pooled.
     if args.subsample and args.subsample < len(y):
         idx = subsample_cohort(np.array(y), patient, args.subsample,
                                seed=args.subsample_seed)
@@ -537,7 +538,15 @@ def main():
               f"target {args.subsample}, subsample-seed {args.subsample_seed} "
               f"-- learning-curve point, NOT the full cohort")
 
-    fingerprint = hashlib.sha1("\n".join(sorted(slide_ids)).encode()).hexdigest()[:10]
+    # Geometry belongs in the hash: two caches built over the same slides
+    # with different region sizes or construction parameters would otherwise
+    # be indistinguishable here and get pooled by combine_results.py. `arms`
+    # is excluded for the same reason as in precompute_graphs.GEOMETRY_KEYS
+    # -- coverage varies per slide and says nothing about the graphs.
+    geom = "|".join(f"{k}={cache_params[k]}"
+                    for k in sorted(cache_params) if k != "arms")
+    fingerprint = hashlib.sha1(
+        (chr(10).join(sorted(slide_ids)) + chr(10) + geom).encode()).hexdigest()[:10]
     print(f"cohort {fingerprint} | {len(files)} cached slides | {n} have a label "
           f"| {len(set(patient))} unique patients")
     # on non-TCGA ids the patient parse is meaningless and every slide becomes

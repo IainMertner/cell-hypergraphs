@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from graphs import (build, load_cache, regions as find_regions, N_TYPES,
+                    microns_to_px,
                     DEFAULT_ARMS, PARAMS, FEATURE_VERSION)
 
 
@@ -32,7 +33,7 @@ from graphs import (build, load_cache, regions as find_regions, N_TYPES,
 # caches must not be mixed. `arms` is excluded -- coverage varies per slide and
 # is reconciled separately. feature_version counts because the cache stores
 # finished feature tensors, so an encoding change invalidates just as hard.
-GEOMETRY_KEYS = ("tile_px", "min_cells", "min_infl", "feature_version",
+GEOMETRY_KEYS = ("tile_um", "min_cells", "min_infl", "feature_version",
                  "k", "radius_um", "hg_radius_um", "max_size",
                  "window_um", "semantic_min_size", "semantic_stride")
 
@@ -58,10 +59,15 @@ def geometry_mismatch(old, new):
     return changed, added
 
 
-def build_one_slide(cache_path, arms, tile_px, min_cells, min_infl):
+def build_one_slide(cache_path, arms, tile_um, min_cells, min_infl):
     """Build every arm's region graphs for one slide. Returns a dict or None."""
     centroids, types, mpp, morph = load_cache(cache_path)
-    regs = find_regions(centroids, tile_px, min_cells)
+    # Regions are cut in MICRONS, like every construction parameter. Cutting in
+    # pixels instead makes a region's physical size depend on the scanner: at
+    # 0.25 um/px a 4000px tile is 1mm^2, at 0.50 it is 4mm^2, so the cell
+    # thresholds below would admit four times the tissue on the coarser slides.
+    # The cohort holds both (595 slides near 0.25, 30 near 0.50, 3 at 0.16).
+    regs = find_regions(centroids, microns_to_px(tile_um, mpp), min_cells)
 
     bags = {a: [] for a in arms}
     kept = 0
@@ -98,7 +104,10 @@ def main():
     ap.add_argument("--arms", nargs="*", default=DEFAULT_ARMS,
                     help="default is the single pw-knn vs hg-knn comparison; "
                          "pass more (e.g. hg-radius) to top up an existing cache")
-    ap.add_argument("--tile-px", type=int, default=4000)
+    ap.add_argument("--tile-um", type=float, default=1000.0,
+                    help="region side in microns. 1000 reproduces the old "
+                         "4000px tile on a 0.25um/px slide, which is 95%% of "
+                         "the cohort, while regularising the rest")
     ap.add_argument("--min-cells", type=int, default=2000)
     ap.add_argument("--min-infl", type=int, default=50)
     ap.add_argument("--limit", type=int, default=0,
@@ -109,7 +118,7 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    params = dict(arms=list(args.arms), tile_px=args.tile_px,
+    params = dict(arms=list(args.arms), tile_um=args.tile_um,
                   min_cells=args.min_cells, min_infl=args.min_infl,
                   feature_version=FEATURE_VERSION,
                   **{k: PARAMS[k] for k in
@@ -171,7 +180,7 @@ def main():
         # build only what is absent; regions are deterministic in the geometry
         # params, so topped-up arms line up index-for-index with the stored bags
         build_arms = missing if existing is not None else list(args.arms)
-        result = build_one_slide(path, build_arms, args.tile_px,
+        result = build_one_slide(path, build_arms, args.tile_um,
                                  args.min_cells, args.min_infl)
         if result is None:
             empty += 1
