@@ -472,7 +472,7 @@ def main():
     cache_params = torch.load(os.path.join(args.graph_cache, "_params.pt"))
     print(f"graph cache: k={cache_params['k']}, "
           f"radius_um={cache_params['radius_um']}, "
-          f"min_infl={cache_params['min_infl']}")
+          f"tile_um={cache_params['tile_um']}")
     for a in args.arms:
         if parse_arm(a)[0] not in cache_params["arms"]:
             raise ValueError(f"arm {a!r} not in graph cache "

@@ -33,7 +33,7 @@ from graphs import (build, load_cache, regions as find_regions, N_TYPES,
 # caches must not be mixed. `arms` is excluded -- coverage varies per slide and
 # is reconciled separately. feature_version counts because the cache stores
 # finished feature tensors, so an encoding change invalidates just as hard.
-GEOMETRY_KEYS = ("tile_um", "min_cells", "min_infl", "feature_version",
+GEOMETRY_KEYS = ("tile_um", "min_cells", "feature_version",
                  "k", "radius_um", "hg_radius_um", "max_size",
                  "window_um", "semantic_min_size", "semantic_stride")
 
@@ -59,22 +59,29 @@ def geometry_mismatch(old, new):
     return changed, added
 
 
-def build_one_slide(cache_path, arms, tile_um, min_cells, min_infl):
+def build_one_slide(cache_path, arms, tile_um, min_cells):
     """Build every arm's region graphs for one slide. Returns a dict or None."""
     centroids, types, mpp, morph = load_cache(cache_path)
     # Regions are cut in MICRONS, like every construction parameter. Cutting in
     # pixels instead makes a region's physical size depend on the scanner: at
     # 0.25 um/px a 4000px tile is 1mm^2, at 0.50 it is 4mm^2, so the cell
-    # thresholds below would admit four times the tissue on the coarser slides.
-    # The cohort holds both (595 slides near 0.25, 30 near 0.50, 3 at 0.16).
+    # threshold below would admit four times the tissue on the coarser slides.
+    # The cohort holds both: most slides near 0.25, a minority near 0.50, and a
+    # few finer still.
     regs = find_regions(centroids, microns_to_px(tile_um, mpp), min_cells)
 
     bags = {a: [] for a in arms}
+    # Per-region inflammatory count, recorded but NOT filtered on. An immune
+    # threshold here would bake one task's assumption into a cache every task
+    # shares: on a target with no immune component it silently selects regions
+    # for an irrelevant property, and undoing it costs a full rebuild. Storing
+    # the count leaves the choice to training time, where it is per-task and
+    # reversible.
+    infl = []
     kept = 0
     for mask, _, _ in regs:
         c, t, m = centroids[mask], types[mask], morph[mask]
-        if int((t == 2).sum()) < min_infl:                 # 2 = Inflammatory
-            continue
+        infl.append(int((t == 2).sum()))                   # 2 = Inflammatory
         kept += 1
         for a in arms:
             d = build(a, c, t, mpp, morph=m)
@@ -94,7 +101,8 @@ def build_one_slide(cache_path, arms, tile_um, min_cells, min_infl):
     frac = np.array([(types == k).mean() for k in range(1, N_TYPES + 1)])
     abund = torch.tensor(np.concatenate([frac, [np.log1p(len(types))]]),
                          dtype=torch.float)
-    return dict(bags=bags, abundance=abund, n_regions=kept)
+    return dict(bags=bags, abundance=abund, n_regions=kept,
+                region_inflammatory=torch.tensor(infl, dtype=torch.long))
 
 
 def main():
@@ -109,7 +117,6 @@ def main():
                          "4000px tile on a 0.25um/px slide, which is 95%% of "
                          "the cohort, while regularising the rest")
     ap.add_argument("--min-cells", type=int, default=2000)
-    ap.add_argument("--min-infl", type=int, default=50)
     ap.add_argument("--limit", type=int, default=0,
                     help="build only the first N slides (0 = all). For a quick "
                          "measurement run before committing to a full precompute "
@@ -119,7 +126,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     params = dict(arms=list(args.arms), tile_um=args.tile_um,
-                  min_cells=args.min_cells, min_infl=args.min_infl,
+                  min_cells=args.min_cells,
                   feature_version=FEATURE_VERSION,
                   **{k: PARAMS[k] for k in
                      ("k", "radius_um", "hg_radius_um", "max_size",
@@ -181,7 +188,7 @@ def main():
         # params, so topped-up arms line up index-for-index with the stored bags
         build_arms = missing if existing is not None else list(args.arms)
         result = build_one_slide(path, build_arms, args.tile_um,
-                                 args.min_cells, args.min_infl)
+                                 args.min_cells)
         if result is None:
             empty += 1
             print(f"[{i+1}/{len(caches)}] {sid}: no valid regions, skipped")
