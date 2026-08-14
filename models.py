@@ -60,7 +60,15 @@ class DeepSetsHyperConv(nn.Module):
 
     rho(sum phi(x)), the Zaheer et al. universal form for permutation-invariant
     set functions. Pooling members is a SUM, preserving set cardinality that a
-    mean divides out. log(set size) is fed to rho explicitly.
+    mean divides out.
+
+    use_size feeds log(|e|) to rho as its own channel. OFF by default, and that
+    is the thesis-relevant setting: summation already carries cardinality in the
+    magnitude of the total, so an explicit channel hands the model set size as a
+    FEATURE rather than through the structure. Any advantage it produces ports
+    to a pairwise graph in one line (GINLayer's use_degree, its twin), so
+    enabling it on the primary arm would answer a feature-engineering question
+    in place of a representational one. Run the two as an ablation pair instead.
 
     `back` controls the RETURN path: "mean" averages over the hyperedges
     containing a node and discards node degree; "sum" keeps it. GCNConv retains
@@ -77,18 +85,21 @@ class DeepSetsHyperConv(nn.Module):
     where the sum happens in input space and the outer map changes width.
     """
 
-    def __init__(self, in_dim, out_dim, hidden=None, back="mean", n_families=1):
+    def __init__(self, in_dim, out_dim, hidden=None, back="mean", n_families=1,
+                 use_size=False):
         super().__init__()
         hidden = hidden or out_dim
         self.back = back
         self.n_families = n_families
         self.hidden = hidden
         self.in_dim = in_dim
+        self.use_size = use_size
         self.phi = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
         # rho stays SHARED across families -- log1p compresses 5 vs 200 members
         # to 1.8 vs 5.3, which one transform handles. Only the return path has
         # to be separated, because that is where the sum is irreversible.
-        self.rho = nn.Sequential(nn.Linear(hidden + 1, in_dim), nn.ReLU())
+        self.rho = nn.Sequential(
+            nn.Linear(hidden + (1 if use_size else 0), in_dim), nn.ReLU())
         self.eps = nn.Parameter(torch.zeros(1))
         # Multi-family arms keep one vector per family so `out` can weight them
         # independently; a single projection back to in_dim restores the width
@@ -106,9 +117,12 @@ class DeepSetsHyperConv(nn.Module):
         m = self.phi(x)
         he = scatter(m[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
-        size = scatter(torch.ones_like(edge_idx, dtype=x.dtype), edge_idx,
-                       dim=0, dim_size=num_hyperedges, reduce="sum").unsqueeze(1)
-        he = self.rho(torch.cat([he, size.log1p()], dim=1))
+        if self.use_size:
+            size = scatter(torch.ones_like(edge_idx, dtype=x.dtype), edge_idx,
+                           dim=0, dim_size=num_hyperedges,
+                           reduce="sum").unsqueeze(1)
+            he = torch.cat([he, size.log1p()], dim=1)
+        he = self.rho(he)
         back = _back_by_family(he, node_idx, edge_idx, n, self.back,
                                family_id, self.n_families)
         if self.proj is not None:
@@ -363,12 +377,18 @@ class HyperRegionEncoder(nn.Module):
     Both preserve cardinality; only the first also learns what to aggregate.
     """
 
-    # name -> (layer, return-path reduction). `2` means sum on the way back too,
-    # so node degree survives; plain names keep the mean earlier results used.
-    AGGS = {"deepsets":  (DeepSetsHyperConv, "mean"),
-            "deepsets2": (DeepSetsHyperConv, "sum"),
-            "sum":       (SumHyperConv, "mean"),
-            "sum2":      (SumHyperConv, "sum")}
+    # name -> (layer, return-path reduction, explicit size channel). `2` means
+    # sum on the way back too, so node incidence degree survives; plain names
+    # keep the mean earlier results used. "+size" feeds log|e| to rho as its own
+    # input -- the ablation twin of the pairwise "gin+deg", and off everywhere
+    # else so that cardinality reaches the model through the structure rather
+    # than as a hand-supplied feature.
+    AGGS = {"deepsets":       (DeepSetsHyperConv, "mean", False),
+            "deepsets2":      (DeepSetsHyperConv, "sum",  False),
+            "deepsets+size":  (DeepSetsHyperConv, "mean", True),
+            "deepsets2+size": (DeepSetsHyperConv, "sum",  True),
+            "sum":            (SumHyperConv, "mean", False),
+            "sum2":           (SumHyperConv, "sum",  False)}
 
     def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None,
                  n_families=1):
@@ -377,11 +397,12 @@ class HyperRegionEncoder(nn.Module):
         if agg not in self.AGGS:
             raise ValueError(f"unknown hypergraph agg {agg!r}; expected one of "
                              f"{sorted(self.AGGS)}")
-        Conv, back = self.AGGS[agg]
+        Conv, back, use_size = self.AGGS[agg]
         self.agg = agg
         self.n_families = n_families
-        self.c1 = Conv(in_dim, hidden, back=back, n_families=n_families)
-        self.c2 = Conv(hidden, hidden, back=back, n_families=n_families)
+        kw = {"use_size": use_size} if Conv is DeepSetsHyperConv else {}
+        self.c1 = Conv(in_dim, hidden, back=back, n_families=n_families, **kw)
+        self.c2 = Conv(hidden, hidden, back=back, n_families=n_families, **kw)
         self.proj = nn.Linear(3 * hidden, out_dim)
         self.out_dim = out_dim
 
@@ -715,10 +736,11 @@ class NodeClassifier(nn.Module):
             if agg not in HyperRegionEncoder.AGGS:
                 raise ValueError(f"unknown hypergraph agg {agg!r}; expected one "
                                  f"of {sorted(HyperRegionEncoder.AGGS)}")
-            Conv, back = HyperRegionEncoder.AGGS[agg]
+            Conv, back, use_size = HyperRegionEncoder.AGGS[agg]
             nf = 1 if blend_families else n_families(arm)
-            self.c1 = Conv(in_dim, hidden, back=back, n_families=nf)
-            self.c2 = Conv(hidden, hidden, back=back, n_families=nf)
+            kw = {"use_size": use_size} if Conv is DeepSetsHyperConv else {}
+            self.c1 = Conv(in_dim, hidden, back=back, n_families=nf, **kw)
+            self.c2 = Conv(hidden, hidden, back=back, n_families=nf, **kw)
         self.head = nn.Linear(hidden, n_classes)
 
     def forward(self, x, struct, num_hyperedges=None, family_id=None):

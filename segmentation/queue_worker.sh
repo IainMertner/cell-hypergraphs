@@ -6,7 +6,7 @@
 #     bash queue_worker.sh /shared/path/queue
 #
 # The queue directory holds:
-#     todo.tsv        the batch, "uuid filename size" per line (make_batch.py)
+#     shared_pcs.tsv  the batch, "uuid filename size" per line (make_batch.py)
 #     claims/<ID>/    created atomically by whichever machine took that slide
 #     failed/<ID>     written when a slide could not be segmented
 #
@@ -24,6 +24,7 @@
 #   STALE    seconds before a claim whose owner stopped reporting is retaken
 #            default: 7200. A machine that is logged out mid-slide leaves its
 #            claim behind; without this the slide is never done by anyone.
+#   BATCH    path to the batch file  default: <queue>/shared_pcs.tsv
 #   MAX_MP / BATCH_SIZE / RAY_WORKER  passed through to workstation_segment.sh
 #
 # Safe to run twice on the same machine, and safe to re-run after a crash.
@@ -32,7 +33,8 @@ set -uo pipefail          # NOT -e: a failed slide must not kill the worker
 
 QUEUE="${1:?usage: queue_worker.sh <queue-dir>}"
 QUEUE=$(cd "$QUEUE" && pwd) || { echo "FATAL: no such queue dir: $1" >&2; exit 1; }
-TODO="$QUEUE/todo.tsv"
+BATCH_FILE="${BATCH:-$QUEUE/shared_pcs.tsv}"
+TODO="$BATCH_FILE"
 CLAIMS="$QUEUE/claims"
 FAILED="$QUEUE/failed"
 [ -f "$TODO" ] || { echo "FATAL: missing $TODO" >&2; exit 1; }
@@ -50,7 +52,7 @@ mkdir -p "$CLAIMS" "$FAILED" "$KEEP" "$WORK" || {
 HOST=$(hostname -s 2>/dev/null || echo unknown)
 TAG="$HOST.$$"
 echo "worker $TAG | queue $QUEUE | keep $KEEP | work $WORK"
-echo "$(wc -l < "$TODO") slides in todo.tsv"
+echo "$(wc -l < "$TODO") slides in $(basename "$TODO")"
 
 # A claim is only meaningful while its owner is alive. The owner touches
 # heartbeat every 60s from a background process, so a claim with an old
