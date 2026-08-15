@@ -76,9 +76,10 @@ claim_is_stale() {
     [ $(( $(date +%s) - hb )) -gt "$STALE" ]
 }
 
-# Take the first slide nobody holds. Returns its line on stdout, or 1 if the
-# queue is exhausted.
-take_next() {
+# Try to claim one slide from a stream of batch lines on stdin. Prints its
+# line and returns 0 on success, 1 if the stream held nothing this machine
+# could take.
+_try_claim() {
     local uuid fname size id
     while read -r uuid fname size; do
         [ -n "${uuid:-}" ] || continue
@@ -93,8 +94,10 @@ take_next() {
             [ "$MAX_MP" -le "$(cat "$TOOBIG/$id")" ] && continue
         fi
         if mkdir "$CLAIMS/$id" 2>/dev/null; then
-            printf '%s\n' "$HOST $$ $(date +%s)" > "$CLAIMS/$id/owner"
-            printf '%s %s %s\n' "$uuid" "$fname" "$size"
+            printf '%s
+' "$HOST $$ $(date +%s)" > "$CLAIMS/$id/owner"
+            printf '%s %s %s
+' "$uuid" "$fname" "$size"
             return 0
         fi
         # held by someone else -- unless they are gone
@@ -102,13 +105,30 @@ take_next() {
             echo "  reclaiming stale $id (owner: $(cat "$CLAIMS/$id/owner" 2>/dev/null))" >&2
             rm -rf "$CLAIMS/$id" 2>/dev/null
             if mkdir "$CLAIMS/$id" 2>/dev/null; then
-                printf '%s\n' "$HOST $$ $(date +%s)" > "$CLAIMS/$id/owner"
-                printf '%s %s %s\n' "$uuid" "$fname" "$size"
+                printf '%s
+' "$HOST $$ $(date +%s)" > "$CLAIMS/$id/owner"
+                printf '%s %s %s
+' "$uuid" "$fname" "$size"
                 return 0
             fi
         fi
-    done < "$TODO"
+    done
     return 1
+}
+
+# Take the first slide nobody holds. Returns its line on stdout, or 1 if the
+# queue is exhausted.
+#
+# Slides handed back for size are tried FIRST, because only a machine roomier
+# than the one that rejected them can do them at all. Left in batch order they
+# accumulate until the end, by which time the machines that could take them may
+# be gone. No ceiling test is needed here: _try_claim skips whatever this
+# machine cannot do, so a small machine simply finds nothing in this pass.
+take_next() {
+    if [ -n "$(ls -A "$TOOBIG" 2>/dev/null)" ]; then
+        _try_claim < <(grep -F -f <(ls "$TOOBIG" | sed 's/$/./') "$TODO") && return 0
+    fi
+    _try_claim < "$TODO"
 }
 
 n_done=0; n_failed=0
