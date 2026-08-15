@@ -9,6 +9,8 @@
 #     shared_pcs.tsv  the batch, "uuid filename size" per line (make_batch.py)
 #     claims/<ID>/    created atomically by whichever machine took that slide
 #     failed/<ID>     written when a slide could not be segmented
+#     toobig/<ID>     the MAX_MP that rejected it, so a machine with the same or
+#                     a tighter limit skips it while a larger one still tries
 #
 # A slide is claimed with mkdir, which is atomic on a shared filesystem and
 # fails if the directory exists. That is the whole locking scheme -- no daemon,
@@ -37,16 +39,20 @@ BATCH_FILE="${BATCH:-$QUEUE/shared_pcs.tsv}"
 TODO="$BATCH_FILE"
 CLAIMS="$QUEUE/claims"
 FAILED="$QUEUE/failed"
+TOOBIG="$QUEUE/toobig"
 [ -f "$TODO" ] || { echo "FATAL: missing $TODO" >&2; exit 1; }
 
 ME=$(basename "$HOME")
 KEEP="${KEEP:-$(dirname "$QUEUE")/cellvit_out}"
 WORK="${WORK:-/tmp/segqueue.$ME}"
 STALE="${STALE:-7200}"
+# read here as well as passed through, because take_next needs it to decide
+# whether a slide another machine rejected is one this machine can still do
+MAX_MP="${MAX_MP:-0}"
 SEGMENT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/workstation_segment.sh"
 [ -f "$SEGMENT" ] || { echo "FATAL: missing $SEGMENT" >&2; exit 1; }
 
-mkdir -p "$CLAIMS" "$FAILED" "$KEEP" "$WORK" || {
+mkdir -p "$CLAIMS" "$FAILED" "$TOOBIG" "$KEEP" "$WORK" || {
     echo "FATAL: cannot create queue dirs under $QUEUE / $KEEP / $WORK" >&2; exit 1; }
 
 HOST=$(hostname -s 2>/dev/null || echo unknown)
@@ -79,6 +85,13 @@ take_next() {
         id="${fname%%.*}"
         [ -f "$KEEP/$id/cells_cache.npz" ] && continue     # done by someone
         [ -e "$FAILED/$id" ] && continue                   # already tried, failed
+        # no usable MPP is a property of the slide, not of the machine
+        grep -qxF "$id" "$KEEP/no_mpp.txt" 2>/dev/null && continue
+        # too large for SOME machine. Skip only if this machine is no roomier:
+        # MAX_MP=0 means no ceiling, so it never skips on this account
+        if [ "$MAX_MP" -gt 0 ] && [ -f "$TOOBIG/$id" ]; then
+            [ "$MAX_MP" -le "$(cat "$TOOBIG/$id")" ] && continue
+        fi
         if mkdir "$CLAIMS/$id" 2>/dev/null; then
             printf '%s\n' "$HOST $$ $(date +%s)" > "$CLAIMS/$id/owner"
             printf '%s %s %s\n' "$uuid" "$fname" "$size"
@@ -106,7 +119,9 @@ while :; do
     echo
     echo "=== $(date +%H:%M:%S) $TAG -> $ID ==="
 
-    heartbeat "$CLAIMS/$ID" &
+    # >/dev/null: the subshell inherits stdout, and its orphaned `sleep`
+    # outlives the kill below -- holding the pipe open if output is piped
+    heartbeat "$CLAIMS/$ID" >/dev/null 2>&1 &
     HB=$!
 
     printf '%s\n' "$LINE" > "$WORK/one.tsv"
@@ -118,11 +133,19 @@ while :; do
         n_done=$((n_done + 1))
         rm -rf "$CLAIMS/$ID"                    # done is recorded by the cache
         echo "  OK ($n_done done, $n_failed failed on this machine)"
-    elif grep -qxF "$ID" "$KEEP/no_mpp.txt" 2>/dev/null \
-      || grep -qxF "$ID" "$KEEP/too_big.txt" 2>/dev/null; then
-        # deliberately skipped, not a failure: leave the claim so no other
-        # machine spends 20 minutes rediscovering the same thing
-        echo "  skipped (no mpp / too large) -- recorded, not retried"
+    elif grep -qxF "$ID" "$KEEP/no_mpp.txt" 2>/dev/null; then
+        # No usable MPP is a property of the slide, true on every machine, so
+        # nobody should retry it. take_next reads no_mpp.txt directly, so the
+        # claim can be released rather than held to keep others off it.
+        rm -rf "$CLAIMS/$ID"
+        echo "  skipped: no usable MPP -- excluded everywhere"
+    elif grep -qxF "$ID" "$KEEP/too_big.txt" 2>/dev/null; then
+        # Too large for THIS machine only. Record the ceiling that rejected it
+        # and release the claim: a machine with a higher MAX_MP, or none at all,
+        # can still take it, while one no roomier skips it without downloading.
+        echo "$MAX_MP" > "$TOOBIG/$ID"
+        rm -rf "$CLAIMS/$ID"
+        echo "  skipped: exceeds MAX_MP=$MAX_MP -- left for a larger machine"
     else
         n_failed=$((n_failed + 1))
         printf '%s %s\n' "$(date -Is)" "$TAG" > "$FAILED/$ID"
@@ -135,4 +158,5 @@ echo
 echo "worker $TAG finished: $n_done segmented, $n_failed failed"
 echo "queue state: $(ls "$CLAIMS" 2>/dev/null | wc -l) in flight, \
 $(ls "$FAILED" 2>/dev/null | wc -l) failed, \
+$(ls "$TOOBIG" 2>/dev/null | wc -l) too big here, \
 $(find "$KEEP" -name cells_cache.npz 2>/dev/null | wc -l) cached"
