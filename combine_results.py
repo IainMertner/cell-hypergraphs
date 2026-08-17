@@ -129,19 +129,24 @@ def main():
     print(f"=== test scores over {len(seeds)} seeds x {ref['folds']} folds "
           f"({n_runs} runs/arm) ===")
     print(f"  {'majority baseline':<18} acc {ref['majority_baseline']:.3f}")
-    print(f"  {base:<18} acc {ab.mean():.3f} +- {ab.std():.3f}"
-          f" | macroF1 {ab_f1.mean():.3f}")
+    print(f"  {base:<18} macroF1 {ab_f1.mean():.3f} +- {ab_f1.std():.3f}"
+          f" | acc {ab.mean():.3f}")
     print(f"  {'':<18} {'':<4}(the bar every arm below must clear)\n")
 
     for arm in ref["arms"]:
         if arm == base:
             continue
         sc, f1 = stack(arm, "acc"), stack(arm, "f1")
-        beat = float((sc > ab).mean())
-        mean_d, _t, p = corrected_t_test(sc - ab, n_te, n_tr)
+        # Tested on macro-F1, not accuracy. Early stopping selects on macro-F1
+        # and the ablations report it, so the headline must use the same
+        # quantity; and under imbalance a model that has collapsed to the
+        # majority class keeps a respectable accuracy while its macro-F1 falls,
+        # so accuracy is the metric least sensitive to the failure that matters.
+        beat = float((f1 > ab_f1).mean())
+        mean_d, _t, p = corrected_t_test(f1 - ab_f1, n_te, n_tr)
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
-        print(f"  {arm:<18} acc {sc.mean():.3f} +- {sc.std():.3f}"
-              f" | macroF1 {f1.mean():.3f}")
+        print(f"  {arm:<18} macroF1 {f1.mean():.3f} +- {f1.std():.3f}"
+              f" | acc {sc.mean():.3f}")
         print(f"  {'':<18} vs {base} {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
         summary["arms"][arm] = dict(
@@ -195,6 +200,7 @@ def main():
         print("")
         print(f"wrote {args.save} (baseline {base})")
     print(f"\n{base} is the bar; the majority baseline is the floor.")
+    print("  - scores and the test are macro-F1; accuracy is shown alongside")
     print("  - macroF1 near floor with respectable acc = collapsed to majority")
     print("  - the +- is a spread, not a standard error: repeated-CV runs share")
     print("    training data, which is what the corrected p accounts for")
