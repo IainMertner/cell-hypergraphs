@@ -42,18 +42,30 @@ def slide_id(path):
     return os.path.basename(os.path.dirname(path))
 
 
+# Keys that decide WHICH REGIONS a slide contributes. A cache predating one of
+# these was built under a different rule, and topping it up would mix region
+# sets within one cache -- so absence is as fatal as disagreement. Everything
+# else in GEOMETRY_KEYS describes a construction, where absence genuinely is
+# harmless: no cached arm used a value for a parameter that did not exist yet.
+REGION_KEYS = ("tile_um", "min_cells", "top_n")
+
+
 def geometry_mismatch(old, new):
     """(changed, added) -- keys the cached params disagree on, and keys it
     predates entirely.
 
-    Changed is fatal. Added is not: nothing in the cache used a value for a key
-    that did not exist yet, so topping up stays consistent -- this is what lets
-    a new construction be added without rebuilding every slide.
+    Changed is always fatal. Added is fatal only for REGION_KEYS: for the rest,
+    nothing in the cache used a value for a key that did not exist yet, so
+    topping up stays consistent -- which is what lets a new construction be
+    added without rebuilding every slide.
     """
     changed, added = {}, {}
     for k in GEOMETRY_KEYS:
         if k not in old:
-            added[k] = new[k]
+            if k in REGION_KEYS:
+                changed[k] = ("<absent>", new[k])
+            else:
+                added[k] = new[k]
         elif old[k] != new[k]:
             changed[k] = (old[k], new[k])
     return changed, added
