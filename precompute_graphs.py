@@ -33,7 +33,7 @@ from graphs import (build, load_cache, regions as find_regions, N_TYPES,
 # caches must not be mixed. `arms` is excluded -- coverage varies per slide and
 # is reconciled separately. feature_version counts because the cache stores
 # finished feature tensors, so an encoding change invalidates just as hard.
-GEOMETRY_KEYS = ("tile_um", "min_cells", "feature_version",
+GEOMETRY_KEYS = ("tile_um", "min_cells", "top_n", "feature_version",
                  "k", "radius_um", "hg_radius_um", "max_size",
                  "window_um", "semantic_min_size", "semantic_stride")
 
@@ -59,7 +59,8 @@ def geometry_mismatch(old, new):
     return changed, added
 
 
-def build_one_slide(cache_path, arms, tile_um, min_cells):
+def build_one_slide(cache_path, arms, tile_um, min_cells, top_n=None,
+                    params=None):
     """Build every arm's region graphs for one slide. Returns a dict or None."""
     centroids, types, mpp, morph = load_cache(cache_path)
     # Regions are cut in MICRONS, like every construction parameter. Cutting in
@@ -68,7 +69,8 @@ def build_one_slide(cache_path, arms, tile_um, min_cells):
     # threshold below would admit four times the tissue on the coarser slides.
     # The cohort holds both: most slides near 0.25, a minority near 0.50, and a
     # few finer still.
-    regs = find_regions(centroids, microns_to_px(tile_um, mpp), min_cells)
+    regs = find_regions(centroids, microns_to_px(tile_um, mpp), min_cells,
+                        top_n=top_n)
 
     bags = {a: [] for a in arms}
     # Per-region inflammatory count, recorded but NOT filtered on. An immune
@@ -84,7 +86,7 @@ def build_one_slide(cache_path, arms, tile_um, min_cells):
         infl.append(int((t == 2).sum()))                   # 2 = Inflammatory
         kept += 1
         for a in arms:
-            d = build(a, c, t, mpp, morph=m)
+            d = build(a, c, t, mpp, morph=m, params=params)
             struct = d.edge_index if a.startswith("pw-") else d.hyperedge_index
             # multi-family arms carry a per-hyperedge family tag, stored as a
             # third slot. Without it the cache cannot distinguish a 6-cell
@@ -112,6 +114,22 @@ def main():
     ap.add_argument("--arms", nargs="*", default=DEFAULT_ARMS,
                     help="default is the single pw-knn vs hg-knn comparison; "
                          "pass more (e.g. hg-radius) to top up an existing cache")
+    # Construction geometry. Each is a GEOMETRY_KEY, so changing one is fatal
+    # to an existing cache and produces a different cohort fingerprint -- a
+    # radius sweep is a set of separate caches and separate experiments, which
+    # is what makes the sensitivity curve honest rather than a pooled average.
+    ap.add_argument("--top-n", type=int, default=40,
+                    help="cap on regions per slide. A seeded RANDOM sample, not "
+                         "the densest: density drives hyperedge cardinality, so "
+                         "selecting dense regions would tilt the comparison "
+                         "toward the hypergraph arm. 0 keeps every region -- at "
+                         "a mean of ~106 per slide that is ~3x the storage and "
+                         "training cost of 40")
+    ap.add_argument("--hg-radius-um", type=float, default=PARAMS["hg_radius_um"],
+                    help="radius for hg-radius AND pw-radius, in microns; both "
+                         "arms read this so the neighbourhood stays matched")
+    ap.add_argument("--k", type=int, default=PARAMS["k"],
+                    help="neighbours for pw-knn and hg-knn")
     ap.add_argument("--tile-um", type=float, default=1000.0,
                     help="region side in microns. 1000 reproduces the old "
                          "4000px tile on a 0.25um/px slide, which is 95%% of "
@@ -125,10 +143,14 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
+    geom = dict(PARAMS)
+    geom["hg_radius_um"] = args.hg_radius_um
+    geom["k"] = args.k
     params = dict(arms=list(args.arms), tile_um=args.tile_um,
                   min_cells=args.min_cells,
+                  top_n=(args.top_n or None),
                   feature_version=FEATURE_VERSION,
-                  **{k: PARAMS[k] for k in
+                  **{k: geom[k] for k in
                      ("k", "radius_um", "hg_radius_um", "max_size",
                       "window_um", "semantic_min_size", "semantic_stride")})
     params_path = os.path.join(args.out, "_params.pt")
@@ -188,7 +210,9 @@ def main():
         # params, so topped-up arms line up index-for-index with the stored bags
         build_arms = missing if existing is not None else list(args.arms)
         result = build_one_slide(path, build_arms, args.tile_um,
-                                 args.min_cells)
+                                 args.min_cells,
+                                 top_n=(args.top_n or None),
+                                 params=geom)
         if result is None:
             empty += 1
             print(f"[{i+1}/{len(caches)}] {sid}: no valid regions, skipped")
