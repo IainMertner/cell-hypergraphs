@@ -406,6 +406,11 @@ def main():
     ap.add_argument("--arms", nargs="*", default=DEFAULT_ARMS,
                     help="default is the single pw-knn vs hg-knn comparison; "
                          "abundance-only always runs as the control")
+    ap.add_argument("--lr", type=float, default=0.01,
+                    help="Adam learning rate, SHARED by every arm. Kept shared "
+                         "deliberately: tuning it per arm would add an axis the "
+                         "comparison does not control, so if one arm needs a "
+                         "different value that is a finding, not a knob")
     ap.add_argument("--hidden", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--subsample", type=int, default=None,
@@ -718,7 +723,7 @@ def main():
             if arm == "abundance-only":
                 m = AbundanceOnly(abund.shape[1], 32, n_classes)
                 r = train_eval_mil(m, None, y, tr, va, te, n_classes, args.epochs,
-                                   0.01, s, abundance=abund,
+                                   args.lr, s, abundance=abund,
                                    device=args.device, class_weight=class_weight,
                                    patience=args.patience,
                                    select_on=args.select_on,
@@ -735,7 +740,7 @@ def main():
                                   abundance_dim=(abund.shape[1] if args.abundance_skip else 0),
                                   path_dropout=args.path_dropout)
                 r = train_eval_mil(m, bags, y, tr, va, te, n_classes, args.epochs,
-                                   0.01, s,
+                                   args.lr, s,
                                    abundance=(abund if args.abundance_skip else None),
                                    device=args.device,
                                    class_weight=class_weight,
@@ -830,6 +835,7 @@ def main():
                 # recorded because it is a design decision, not a nuisance
                 # parameter: it sets how much reach the star baseline gets
                 "star_layers": args.star_layers,
+                "lr": args.lr,
                 "pw_layers": args.pw_layers,
                 "abundance_skip": bool(args.abundance_skip),
                 "path_dropout": args.path_dropout,
