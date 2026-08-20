@@ -102,16 +102,38 @@ def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
                   f"Non-Brisk {int((m & ~brisk).sum()):>3}")
         n_tot = len(df)
         if n_tot:
-            # best rule using briskness alone: per stratum, predict its majority
-            best = sum(max(int(((df.y == c) & b).sum()) for c in classes)
-                       for b in (brisk, ~brisk))
-            maj = max(int((df.y == c).sum()) for c in classes)
-            print(f"  majority baseline    {maj / n_tot:.3f}")
-            print(f"  briskness-only rule  {best / n_tot:.3f}   "
+            # Best rule using briskness alone: per stratum, predict its
+            # majority. Scored in BOTH metrics -- results are compared on
+            # macro-F1, and on an imbalanced split an accuracy bar and a
+            # macro-F1 bar are different numbers, so quoting one against the
+            # other would not be like for like.
+            import numpy as _np
+            y_true = df.y.to_numpy()
+            pred = _np.empty(n_tot, dtype=object)
+            for b in (brisk.to_numpy(), ~brisk.to_numpy()):
+                if b.any():
+                    pred[b] = max(classes, key=lambda c: int(((y_true == c) & b).sum()))
+            maj_class = max(classes, key=lambda c: int((y_true == c).sum()))
+
+            def _mf1(p):
+                f1s = []
+                for c in classes:
+                    tp = int(((p == c) & (y_true == c)).sum())
+                    fp = int(((p == c) & (y_true != c)).sum())
+                    fn = int(((p != c) & (y_true == c)).sum())
+                    f1s.append(0.0 if not tp else
+                               2 * tp / (2 * tp + fp + fn))
+                return sum(f1s) / len(f1s)
+
+            maj_pred = _np.full(n_tot, maj_class, dtype=object)
+            acc_b = float((pred == y_true).mean())
+            acc_m = float((maj_pred == y_true).mean())
+            print(f"  majority baseline    acc {acc_m:.3f} | macroF1 {_mf1(maj_pred):.3f}")
+            print(f"  briskness-only rule  acc {acc_b:.3f} | macroF1 {_mf1(pred):.3f}   "
                   "<- IN-SAMPLE oracle, not cross-validated")
             print("    (an upper bound on briskness alone; the CV-fair "
                   "comparator is the abundance-only arm)")
-            if best / n_tot - maj / n_tot > 0.05:
+            if acc_b - acc_m > 0.05:
                 print("  WARNING: briskness explains much of this target -- an "
                       "arm must clear the\n           briskness-only rule, not "
                       "just the majority baseline.")
