@@ -500,6 +500,16 @@ def main():
             raise ValueError(f"arm {a!r} not in graph cache "
                              f"(cached: {cache_params['arms']}); rerun precompute")
 
+    # Claim the GPU before the cache load, which takes ~20 minutes and uses no
+    # GPU at all. Without this the card looks idle in nvidia-smi for the whole
+    # load and someone else starts a job on it -- then both runs OOM. A CUDA
+    # context is a few hundred MB and makes the process visible from the moment
+    # it starts, which is honest: the machine is in use.
+    if str(args.device).startswith("cuda") and torch.cuda.is_available():
+        _claim = torch.zeros(1, device=args.device)
+        print(f"claimed {args.device} "
+              f"({torch.cuda.get_device_name(0)}) before loading", flush=True)
+
     files = [f for f in sorted(glob.glob(os.path.join(args.graph_cache, "*.pt")))
              if not f.endswith("_params.pt")]
     slide_bags, slide_abund, y, patient, slide_ids = [], [], [], [], []
