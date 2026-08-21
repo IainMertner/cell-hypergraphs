@@ -65,6 +65,9 @@ for T in $(seq "$FIRST" "$LAST"); do
         ${MIN_CLASS:+--min-class $MIN_CLASS} \
         ${PW_LAYERS:+--pw-layers $PW_LAYERS} \
         ${HIDDEN:+--hidden $HIDDEN} \
+        ${LR:+--lr $LR} \
+        ${REGION_DIM:+--region-dim $REGION_DIM} \
+        ${ATT_DIM:+--att-dim $ATT_DIM} \
         ${AB_SKIP:+--abundance-skip} \
         ${PROGRESS:+--progress-every $PROGRESS} \
         --save-results "$OUT_DIR/$NAME.json"

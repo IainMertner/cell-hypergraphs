@@ -406,13 +406,22 @@ def main():
     ap.add_argument("--arms", nargs="*", default=DEFAULT_ARMS,
                     help="default is the single pw-knn vs hg-knn comparison; "
                          "abundance-only always runs as the control")
+    ap.add_argument("--mmap", action="store_true",
+                    help="memory-map the graph cache instead of reading it. The "
+                         "arms this run does not use are then never read at all "
+                         "-- a 4-arm cache read for a 2-arm run is half the I/O "
+                         "wasted. Tensors stay file-backed, so the first touch "
+                         "of each pays a page fault; measure before adopting")
     ap.add_argument("--lr", type=float, default=0.01,
                     help="Adam learning rate, SHARED by every arm. Kept shared "
                          "deliberately: tuning it per arm would add an axis the "
                          "comparison does not control, so if one arm needs a "
                          "different value that is a finding, not a knob")
     ap.add_argument("--hidden", type=int, default=32)
-    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--epochs", type=int, default=150,
+                    help="must match run_patterns_array.sh EPOCHS: a "
+                         "direct run and an array run that cap at "
+                         "different numbers are not poolable")
     ap.add_argument("--subsample", type=int, default=None,
                     help="patient-grouped, class-stratified subsample of ~N "
                          "slides, for learning curves")
@@ -528,7 +537,8 @@ def main():
         if sid not in labels:
             continue
         slide_ids.append(sid)
-        d = torch.load(f)
+        d = (torch.load(f, map_location='cpu', mmap=True)
+             if args.mmap else torch.load(f))
         if _i % 25 == 0 or _i == len(files):
             _el = time.time() - t_load
             print(f"  {_i}/{len(files)} slides | {_el:.0f}s "

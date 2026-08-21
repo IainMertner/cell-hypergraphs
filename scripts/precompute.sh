@@ -6,7 +6,12 @@
 #
 #     qsub scripts/precompute.sh
 #     qsub -v ARMS="pw-knn hg-knn hg-radius" scripts/precompute.sh
-#     qsub -v RADIUS=25 -v OUT=$SC/graph_cache_r25 scripts/precompute.sh
+#     qsub -v RADIUS=25,TOP_N=0,OUT=$SC/graph_cache_r25 scripts/precompute.sh
+#
+# ONE -v, comma-separated. A second -v REPLACES the first rather than
+# adding to it, so `-v RADIUS=25 -v OUT=...` silently builds at the
+# default radius into a directory named for one it never used. That is
+# how graph_cache_r6 and graph_cache_r25 both ended up at 12.5um.
 #
 # RADIUS changes a GEOMETRY_KEY, so it needs its own --out: a cache cannot mix
 # radii, and the cohort fingerprint differs, so radii are separate experiments
