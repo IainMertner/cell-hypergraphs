@@ -92,6 +92,7 @@ STAR_LAYERS="${STAR_LAYERS:-}"
 PW_LAYERS="${PW_LAYERS:-}"          # pairwise depth; 4 reach-matches a hypergraph arm     # @star depth; 4 matches a 2-layer hypergraph arm
 # capacity knobs. HIDDEN sizes the encoder; REGION_DIM/ATT_DIM size the
 # pool+head, which HIDDEN does not touch at all
+LR="${LR:-}"                        # Adam lr, shared by every arm
 HIDDEN="${HIDDEN:-}"
 REGION_DIM="${REGION_DIM:-}"
 ATT_DIM="${ATT_DIM:-}"
@@ -159,6 +160,7 @@ python -u train_patterns.py \
     ${BLEND:+--blend-families} \
     ${STAR_LAYERS:+--star-layers $STAR_LAYERS} \
     ${PW_LAYERS:+--pw-layers $PW_LAYERS} \
+    ${LR:+--lr $LR} \
     ${HIDDEN:+--hidden $HIDDEN} \
     ${REGION_DIM:+--region-dim $REGION_DIM} \
     ${ATT_DIM:+--att-dim $ATT_DIM} \
