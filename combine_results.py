@@ -118,6 +118,15 @@ def main():
     if base not in known:
         raise SystemExit(f"--baseline {base!r} not in this run: {known}")
     ab, ab_f1 = stack(base, "acc"), stack(base, "f1")
+    # a survival run stores the same C-index in both slots; the run records
+    # which metric it is so this need not be inferred from the task name
+    is_surv = ref.get("metric") == "cindex"
+
+    def _line(name, m, sd, a):
+        if is_surv:
+            return f"  {name:<18} C-index {m:.3f} +- {sd:.3f}"
+        return f"  {name:<18} macroF1 {m:.3f} +- {sd:.3f} | acc {a:.3f}"
+
     summary = {k: ref.get(k) for k in
                ("cohort", "n_slides", "n_patients", "task", "classes",
                 "class_counts", "folds", "epochs", "majority_baseline")}
@@ -128,9 +137,11 @@ def main():
         f1=float(ab_f1.mean()), f1_sd=float(ab_f1.std()))
     print(f"=== test scores over {len(seeds)} seeds x {ref['folds']} folds "
           f"({n_runs} runs/arm) ===")
-    print(f"  {'majority baseline':<18} acc {ref['majority_baseline']:.3f}")
-    print(f"  {base:<18} macroF1 {ab_f1.mean():.3f} +- {ab_f1.std():.3f}"
-          f" | acc {ab.mean():.3f}")
+    if is_surv:
+        print(f"  {'chance':<18} C-index 0.500")
+    else:
+        print(f"  {'majority baseline':<18} acc {ref['majority_baseline']:.3f}")
+    print(_line(base, ab_f1.mean(), ab_f1.std(), ab.mean()))
     print(f"  {'':<18} {'':<4}(the bar every arm below must clear)\n")
 
     for arm in ref["arms"]:
@@ -145,8 +156,7 @@ def main():
         beat = float((f1 > ab_f1).mean())
         mean_d, _t, p = corrected_t_test(f1 - ab_f1, n_te, n_tr)
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
-        print(f"  {arm:<18} macroF1 {f1.mean():.3f} +- {f1.std():.3f}"
-              f" | acc {sc.mean():.3f}")
+        print(_line(arm, f1.mean(), f1.std(), sc.mean()))
         print(f"  {'':<18} vs {base} {mean_d:+.3f} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
         summary["arms"][arm] = dict(
@@ -199,8 +209,11 @@ def main():
             json.dump(summary, fh, indent=2)
         print("")
         print(f"wrote {args.save} (baseline {base})")
-    print(f"\n{base} is the bar; the majority baseline is the floor.")
-    print("  - scores and the test are macro-F1; accuracy is shown alongside")
+    print(f"\n{base} is the bar; " + ("chance (0.500) is the floor."
+          if is_surv else "the majority baseline is the floor."))
+    print("  - scores and the test are " + ("Harrell's C-index: 0.5 is "
+          "chance, and only the ranking of risk scores matters"
+          if is_surv else "macro-F1; accuracy is shown alongside"))
     print("  - macroF1 near floor with respectable acc = collapsed to majority")
     print("  - the +- is a spread, not a standard error: repeated-CV runs share")
     print("    training data, which is what the corrected p accounts for")

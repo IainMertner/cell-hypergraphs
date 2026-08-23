@@ -147,10 +147,70 @@ def load_labels(csv_path, task, label_col="PatternLabels", min_class=5):
     return dict(zip(df.SlideID, df.y.map(idx))), classes
 
 
+def cox_loss(risk, time, event):
+    """Breslow negative partial log-likelihood over one minibatch.
+
+    Survival has no per-sample loss: each death is scored against the RISK SET
+    of everyone still alive at that moment, so the whole batch must sit in one
+    graph. Sorting by descending time makes position i's cumulative logsumexp
+    exactly the log-denominator of its risk set, which is why this is a single
+    logcumsumexp rather than a loop over deaths.
+
+    In minibatch training the risk set is drawn from the batch, not the fold --
+    the standard approximation for deep survival models, and the reason survival
+    wants a larger batch than classification does. A batch with no deaths in it
+    contributes no gradient; returning a zero tied to `risk` keeps the graph
+    intact so .backward() does not fail on it.
+    """
+    order = torch.argsort(time, descending=True)
+    r, e = risk[order], event[order]
+    ll = (r - torch.logcumsumexp(r, dim=0))[e > 0]
+    if ll.numel() == 0:
+        return (risk * 0.0).sum()
+    return -ll.mean()
+
+
+def c_index(risk, time, event):
+    """Harrell's C: the fraction of orderable pairs the risk score ranks right.
+
+    A pair is orderable when the earlier of the two is a death -- if the earlier
+    one was censored, the other may have died before or after and the pair says
+    nothing. Ties in risk score count a half. 0.5 is chance, which is the floor
+    a survival model is judged against instead of a majority baseline.
+    """
+    risk = np.asarray(risk, dtype=float)
+    time = np.asarray(time, dtype=float)
+    event = np.asarray(event)
+    comparable = (event[:, None] > 0) & (time[None, :] > time[:, None])
+    if not comparable.any():
+        return 0.5
+    ri, rj = risk[:, None], risk[None, :]
+    return float(((ri > rj).astype(float) + 0.5 * (ri == rj))[comparable].mean())
+
+
+def load_survival(csv_path):
+    """CSV -> ({slide id: (time, event)}, class names).
+
+    Survival is the one task whose label is not categorical, so it gets its own
+    loader rather than a mode of load_labels. `classes` is returned only so the
+    rest of main stays shape-compatible; the model emits one risk score.
+    """
+    df = pd.read_csv(csv_path)
+    need = {"SlideID", "time", "event"}
+    if not need <= set(df.columns):
+        raise SystemExit(f"{csv_path} needs columns {sorted(need)}; "
+                         f"has {sorted(df.columns)}. Build it with "
+                         "make_survival_labels.py")
+    df = df[["SlideID", "time", "event"]].dropna()
+    df = df[df.time > 0]
+    lab = {r.SlideID: (float(r.time), int(r.event)) for r in df.itertuples()}
+    return lab, ["risk"]
+
+
 def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, seed,
                    abundance=None, device="cpu", patience=20, class_weight=None,
                    select_on="macro_f1", batch_size=8, progress_every=0,
-                   tag=""):
+                   objective="ce", tag=""):
     """Train on `tr`, early-stop on `va`, score `te`. Returns (accuracy, macro-F1).
 
     batch_size: slides per optimiser step. This was FULL BATCH -- gradients
@@ -215,14 +275,29 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         return model(bag, a)[0]
 
     y_np = labels_t.detach().cpu().numpy()
+    # survival carries (time, event) per slide where classification carries a
+    # class index, so everything downstream reads these two instead of y_np
+    surv_t, surv_e = ((y_np[:, 0], y_np[:, 1]) if objective == "cox"
+                      else (None, None))
+
+    def _out(i, **kw):
+        """One slide's prediction: a class index, or a scalar risk score."""
+        o = run(i, **kw)
+        return float(o.reshape(-1)[0]) if objective == "cox" else int(o.argmax())
 
     def preds(idx, src=None, what=None):
         """src: parallel array of slides to take `what` ('ab'|'bag') from."""
         if src is None:
-            return np.array([int(run(i).argmax()) for i in idx])
+            return np.array([_out(i) for i in idx])
         kw = "ab_i" if what == "ab" else "bag_i"
-        return np.array([int(run(i, **{kw: j}).argmax())
-                         for i, j in zip(idx, src)])
+        return np.array([_out(i, **{kw: j}) for i, j in zip(idx, src)])
+
+    def _sel(p, idx):
+        """The quantity early stopping watches on the validation split."""
+        if objective == "cox":
+            return c_index(p, surv_t[idx], surv_e[idx])
+        return (float((p == y_np[idx]).mean()) if select_on == "acc"
+                else macro_f1(p, y_np[idx], n_classes))
 
     # Snapshot best-val weights and score test once at the end -- same result as
     # re-scoring test on every improvement, ~20% fewer forward passes. Safe
@@ -238,18 +313,26 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         order = tr[rng.permutation(len(tr))]
         for start in range(0, len(order), bs):
             chunk = order[start:start + bs]
-            d = _denom(chunk)
             opt.zero_grad()
-            for i in chunk:
-                loss = F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1],
-                                       weight=class_weight, reduction="sum") / d
-                loss.backward()      # accumulates into .grad; graph freed here
+            if objective == "cox":
+                # The risk set spans the chunk, so unlike cross-entropy this
+                # cannot be backwarded slide by slide -- every risk score in the
+                # batch has to be live in one graph at once. That is the reason
+                # survival needs more memory per step than the other tasks.
+                idx = torch.as_tensor(np.asarray(chunk), device=device).long()
+                risk = torch.stack([run(i).reshape(-1)[0] for i in chunk])
+                cox_loss(risk, labels_t[idx, 0], labels_t[idx, 1]).backward()
+            else:
+                d = _denom(chunk)
+                for i in chunk:
+                    loss = F.cross_entropy(run(i).unsqueeze(0), labels_t[i:i + 1],
+                                           weight=class_weight, reduction="sum") / d
+                    loss.backward()  # accumulates into .grad; graph freed here
             opt.step()
         model.eval()
         with torch.no_grad():
             vp = preds(va)
-            score = (float((vp == y_np[va]).mean()) if select_on == "acc"
-                     else macro_f1(vp, y_np[va], n_classes))
+            score = _sel(vp, va)
             if score > best_val:
                 best_val, since, best_epoch = score, 0, ep
                 best_state = {k: v.detach().clone()
@@ -274,7 +357,17 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
     with torch.no_grad():
         # macro-F1 alongside accuracy makes majority collapse visible
         tp = preds(te)
-        acc, f1 = float((tp == y_np[te]).mean()), macro_f1(tp, y_np[te], n_classes)
+        if objective == "cox":
+            # both slots hold the C-index: the saved JSON records which metric
+            # it is, so combine_results.py labels it rather than inferring
+            acc = f1 = c_index(tp, surv_t[te], surv_e[te])
+        else:
+            acc = float((tp == y_np[te]).mean())
+            f1 = macro_f1(tp, y_np[te], n_classes)
+
+        def _abl(p):
+            return (c_index(p, surv_t[te], surv_e[te]) if objective == "cox"
+                    else macro_f1(p, y_np[te], n_classes))
         # PERMUTATION ablations, not zeroing.
         #
         # Zeroing a path measures which branch won the optimisation, not what
@@ -293,9 +386,9 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
             pr = np.asarray(te)[rng.permutation(len(te))]
             if getattr(model, "abundance_dim", 0):
                 pa = preds(te, src=pr, what="ab")
-                abl["f1_abundance_permuted"] = macro_f1(pa, y_np[te], n_classes)
+                abl["f1_abundance_permuted"] = _abl(pa)
             pg = preds(te, src=pr, what="bag")
-            abl["f1_graph_permuted"] = macro_f1(pg, y_np[te], n_classes)
+            abl["f1_graph_permuted"] = _abl(pg)
         return acc, f1, stopped_at, best_epoch, abl
 
 
@@ -395,7 +488,8 @@ def main():
     ap.add_argument("--graph-cache", default="graph_cache",
                     help="dir of precomputed per-slide graphs (precompute_graphs.py)")
     ap.add_argument("--labels", required=True)
-    ap.add_argument("--task", choices=["pattern4", "arrangement", "auto"],
+    ap.add_argument("--task", choices=["pattern4", "arrangement", "auto",
+                                      "survival"],
                     default="pattern4",
                     help="pattern4/arrangement are the TIL mappings; auto reads "
                          "--label-col as-is for any categorical slide-level task")
@@ -500,10 +594,19 @@ def main():
                     help="regions encoded per GPU pass; lower if OOM on big slides")
     args = ap.parse_args()
 
-    labels, classes = load_labels(args.labels, args.task,
-                                  args.label_col, args.min_class)
-    n_classes = len(classes)
-    print(f"task={args.task} | {n_classes} classes: {classes}")
+    if args.task == "survival":
+        labels, classes = load_survival(args.labels)
+        n_classes = 1                      # one risk score, no softmax
+        _ev = sum(e for _, e in labels.values())
+        print(f"task=survival | {len(labels)} slides with follow-up | "
+              f"{_ev} events ({_ev / max(len(labels), 1):.1%})")
+        print("  what is learnable is bounded by the EVENT count, not the "
+              "slide count")
+    else:
+        labels, classes = load_labels(args.labels, args.task,
+                                      args.label_col, args.min_class)
+        n_classes = len(classes)
+        print(f"task={args.task} | {n_classes} classes: {classes}")
 
     cache_params = torch.load(os.path.join(args.graph_cache, "_params.pt"))
     print(f"graph cache: k={cache_params['k']}, "
@@ -573,7 +676,11 @@ def main():
     # Subsample first, so each learning-curve point gets its own identity and
     # cannot be pooled.
     if args.subsample and args.subsample < len(y):
-        idx = subsample_cohort(np.array(y), patient, args.subsample,
+        # stratify the subsample on the event indicator for survival: one
+        # balanced on follow-up TIME would be meaningless
+        _sy = (np.array([e for _, e in y]) if args.task == "survival"
+               else np.array(y))
+        idx = subsample_cohort(_sy, patient, args.subsample,
                                seed=args.subsample_seed)
         slide_bags = [slide_bags[i] for i in idx]
         slide_abund = [slide_abund[i] for i in idx]
@@ -606,14 +713,31 @@ def main():
         print("too few labelled slides for cross-validation.")
         return
 
-    y = torch.tensor(y).long()
     abund = torch.stack(slide_abund)
-    counts = {c: int((y == i).sum()) for i, c in enumerate(classes)}
-    print(f"class counts {counts}")
-    # inverse-frequency class weights for the loss
-    freq = torch.tensor([max(counts[c], 1) for c in classes], dtype=torch.float)
-    class_weight = (freq.sum() / (len(classes) * freq))
-    print(f"class weights {[round(w, 2) for w in class_weight.tolist()]}\n")
+    if args.task == "survival":
+        y = torch.tensor(y, dtype=torch.float)     # (N, 2): time, event
+        class_weight = None                        # Cox has no class to weight
+        # folds stratify on the EVENT indicator: without it a fold can land
+        # with very few deaths and its C-index is then near-meaningless
+        strat = y[:, 1].numpy().astype(int)
+        n_ev = int(strat.sum())
+        counts = {"event": n_ev, "censored": int(n - n_ev)}
+        print(f"events {n_ev} / {n} ({n_ev / n:.1%}) | median follow-up "
+              f"{float(y[:, 0].median()):.1f} months")
+        if n_ev < 100:
+            print("  WARNING: under 100 events. The C-index interval will "
+                  "be wide whatever the slide count.")
+        print()
+    else:
+        y = torch.tensor(y).long()
+        strat = y.numpy()
+        counts = {c: int((y == i).sum()) for i, c in enumerate(classes)}
+        print(f"class counts {counts}")
+        # inverse-frequency class weights for the loss
+        freq = torch.tensor([max(counts[c], 1) for c in classes],
+                            dtype=torch.float)
+        class_weight = (freq.sum() / (len(classes) * freq))
+        print(f"class weights {[round(w, 2) for w in class_weight.tolist()]}\n")
 
     in_dim = slide_bags[0][parse_arm(args.arms[0])[0]][0][0].shape[1]
     # Match on the whole model, per arm rather than per family: GCNConv is one
@@ -677,7 +801,7 @@ def main():
     # --seed runs one seed, so a sweep can be split across array tasks -- folds are
     # deterministic in (cohort, k, seed), so a split run is bit-identical.
     seed_list = [args.seed] if args.seed is not None else list(range(args.seeds))
-    fold_sets = {s: _make_folds(y.numpy(), patient, args.folds, seed=s)
+    fold_sets = {s: _make_folds(strat, patient, args.folds, seed=s)
                  for s in seed_list}
     runs = [(s, f, tr, va, te) for s in seed_list
             for f, (tr, va, te) in enumerate(fold_sets[s])]
@@ -738,6 +862,8 @@ def main():
                                    patience=args.patience,
                                    select_on=args.select_on,
                                    batch_size=args.batch_size,
+                                   objective=("cox" if args.task == "survival"
+                                              else "ce"),
                                    progress_every=args.progress_every,
                                    tag=f"[{arm}] {j}/{len(runs)} ")
             else:
@@ -757,6 +883,8 @@ def main():
                                    patience=args.patience,
                                    select_on=args.select_on,
                                    batch_size=args.batch_size,
+                                   objective=("cox" if args.task == "survival"
+                                              else "ce"),
                                    progress_every=args.progress_every,
                                    tag=f"[{arm}] {j}/{len(runs)} ")
             scores.append(r[:2])
@@ -789,7 +917,10 @@ def main():
         return a[:, 0], a[:, 1]
 
     ablations = {}
-    maj = float((y == y.bincount().argmax()).float().mean())
+    if args.task == "survival":
+        maj = 0.5                          # a C-index of 0.5 is chance
+    else:
+        maj = float((y == y.bincount().argmax()).float().mean())
     n_te = float(np.mean([len(te) for _, _, _, _, te in runs]))
     n_tr = float(np.mean([len(tr) for _, _, tr, _, _ in runs]))
 
@@ -836,6 +967,10 @@ def main():
                 "subsample_seed": args.subsample_seed,
                 "n_patients": len(set(patient)),
                 "task": args.task,
+                # combine_results.py labels the axis from this rather
+                # than guessing: survival stores a C-index in the same
+                # slots a classification run stores accuracy/macro-F1
+                "metric": "cindex" if args.task == "survival" else "macro_f1",
                 "classes": classes,
                 "class_counts": counts,
                 "majority_baseline": maj,

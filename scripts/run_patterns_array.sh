@@ -161,6 +161,7 @@ python -u train_patterns.py \
     ${STAR_LAYERS:+--star-layers $STAR_LAYERS} \
     ${PW_LAYERS:+--pw-layers $PW_LAYERS} \
     ${LR:+--lr $LR} \
+    ${BATCH:+--batch-size $BATCH} \
     ${HIDDEN:+--hidden $HIDDEN} \
     ${REGION_DIM:+--region-dim $REGION_DIM} \
     ${ATT_DIM:+--att-dim $ATT_DIM} \
