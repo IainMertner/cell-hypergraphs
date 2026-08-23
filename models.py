@@ -86,9 +86,12 @@ class DeepSetsHyperConv(nn.Module):
     """
 
     def __init__(self, in_dim, out_dim, hidden=None, back="mean", n_families=1,
-                 use_size=False):
+                 use_size=False, combine="add", rho_mlp=False):
         super().__init__()
         hidden = hidden or out_dim
+        if combine not in ("add", "concat"):
+            raise ValueError(f"combine must be 'add' or 'concat', got {combine!r}")
+        self.combine = combine
         self.back = back
         self.n_families = n_families
         self.hidden = hidden
@@ -98,14 +101,24 @@ class DeepSetsHyperConv(nn.Module):
         # rho stays SHARED across families -- log1p compresses 5 vs 200 members
         # to 1.8 vs 5.3, which one transform handles. Only the return path has
         # to be separated, because that is where the sum is irreversible.
-        self.rho = nn.Sequential(
-            nn.Linear(hidden + (1 if use_size else 0), in_dim), nn.ReLU())
+        # rho_mlp gives rho a hidden layer, making it a universal approximator
+        # of functions of the hyperedge total rather than one affine map and a
+        # nonlinearity. It is the only transform in this layer that no stacking
+        # argument reaches: GIN has one aggregation per layer, so its MLP always
+        # sits between consecutive sums, whereas the node->hyperedge and
+        # hyperedge->node sums here are separated by rho alone. Shaped like
+        # GIN's MLP (Linear, ReLU, Linear) with no trailing nonlinearity.
+        _rin = hidden + (1 if use_size else 0)
+        self.rho = (nn.Sequential(nn.Linear(_rin, hidden), nn.ReLU(),
+                                  nn.Linear(hidden, in_dim))
+                    if rho_mlp else
+                    nn.Sequential(nn.Linear(_rin, in_dim), nn.ReLU()))
         self.eps = nn.Parameter(torch.zeros(1))
         # Multi-family arms keep one vector per family so `out` can weight them
         # independently; a single projection back to in_dim restores the width
         # the addition needs while leaving the families separable inside it.
         self.proj = nn.Linear(in_dim * n_families, in_dim) if n_families > 1 else None
-        self.out = nn.Linear(in_dim, out_dim)
+        self.out = nn.Linear(in_dim * (2 if combine == "concat" else 1), out_dim)
 
     def forward(self, x, hyperedge_index, num_hyperedges=None, family_id=None):
         node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
@@ -113,7 +126,7 @@ class DeepSetsHyperConv(nn.Module):
         if num_hyperedges is None:
             num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
         if num_hyperedges == 0:                       # degenerate region
-            return self.out((1 + self.eps) * x)
+            return self._combine(x, torch.zeros_like(x))
         m = self.phi(x)
         he = scatter(m[node_idx], edge_idx, dim=0,
                      dim_size=num_hyperedges, reduce="sum")
@@ -127,6 +140,24 @@ class DeepSetsHyperConv(nn.Module):
                                family_id, self.n_families)
         if self.proj is not None:
             back = self.proj(back)
+        return self._combine(x, back)
+
+    def _combine(self, x, back):
+        """How a node's own representation meets what came back from its edges.
+
+        "add" is GIN's (1 + eps) x + b, and is the MATCHED setting: the pairwise
+        arm combines self and context exactly this way, so the two arms differ
+        in representation and in nothing else.
+
+        "concat" is W([x ; b]), which is strictly more general -- it subsumes the
+        addition -- and is therefore NOT matched. It exists for the unconstrained
+        comparison: whether a hypergraph layer given freedom the pairwise arm
+        does not have beats it. A win there is attributable to the combination
+        as much as to the representation, which is why it is reported separately
+        rather than as the primary arm.
+        """
+        if self.combine == "concat":
+            return self.out(torch.cat([x, back], dim=1))
         return self.out((1 + self.eps) * x + back)
 
 class SumHyperConv(nn.Module):
@@ -383,12 +414,20 @@ class HyperRegionEncoder(nn.Module):
     # input -- the ablation twin of the pairwise "gin+deg", and off everywhere
     # else so that cardinality reaches the model through the structure rather
     # than as a hand-supplied feature.
-    AGGS = {"deepsets":       (DeepSetsHyperConv, "mean", False),
-            "deepsets2":      (DeepSetsHyperConv, "sum",  False),
-            "deepsets+size":  (DeepSetsHyperConv, "mean", True),
-            "deepsets2+size": (DeepSetsHyperConv, "sum",  True),
-            "sum":            (SumHyperConv, "mean", False),
-            "sum2":           (SumHyperConv, "sum",  False)}
+    # (layer, return-path aggregation, size channel, self/context combine, rho MLP)
+    AGGS = {"deepsets":       (DeepSetsHyperConv, "mean", False, "add", False),
+            "deepsets2":      (DeepSetsHyperConv, "sum",  False, "add", False),
+            "deepsets+size":  (DeepSetsHyperConv, "mean", True,  "add", False),
+            "deepsets2+size": (DeepSetsHyperConv, "sum",  True,  "add", False),
+            # UNMATCHED: more general than GIN's combination, so it answers
+            # "does a hypergraph layer win when unconstrained", not the
+            # representational question the primary arms are built for
+            "deepsets2+cat":  (DeepSetsHyperConv, "sum",  False, "concat", False),
+            # rho as a perceptron: the strictly section-3.5-compliant arm. Run
+            # against deepsets2 to measure what the simplification costs
+            "deepsets2+mlp":  (DeepSetsHyperConv, "sum",  False, "add", True),
+            "sum":            (SumHyperConv, "mean", False, "add", False),
+            "sum2":           (SumHyperConv, "sum",  False, "add", False)}
 
     def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None,
                  n_families=1):
@@ -397,10 +436,11 @@ class HyperRegionEncoder(nn.Module):
         if agg not in self.AGGS:
             raise ValueError(f"unknown hypergraph agg {agg!r}; expected one of "
                              f"{sorted(self.AGGS)}")
-        Conv, back, use_size = self.AGGS[agg]
+        Conv, back, use_size, combine, rho_mlp = self.AGGS[agg]
         self.agg = agg
         self.n_families = n_families
-        kw = {"use_size": use_size} if Conv is DeepSetsHyperConv else {}
+        kw = ({"use_size": use_size, "combine": combine, "rho_mlp": rho_mlp}
+              if Conv is DeepSetsHyperConv else {})
         self.c1 = Conv(in_dim, hidden, back=back, n_families=n_families, **kw)
         self.c2 = Conv(hidden, hidden, back=back, n_families=n_families, **kw)
         self.proj = nn.Linear(3 * hidden, out_dim)
