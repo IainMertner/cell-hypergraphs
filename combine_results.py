@@ -17,7 +17,7 @@ import os
 
 import numpy as np
 
-from train_patterns import corrected_t_test
+from corrected_test import corrected_t_test
 
 
 def load_parts(paths):

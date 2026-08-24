@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from scipy import stats
+from corrected_test import corrected_t_test
 
 from graphs import N_TYPES, DEFAULT_ARMS
 from models import (set_seed, matched_hidden, n_params, macro_f1,
@@ -421,25 +421,7 @@ def subsample_cohort(y, patient, target_n, seed=0):
     return idx
 
 
-def corrected_t_test(diffs, n_test, n_train):
-    """Nadeau & Bengio corrected resampled t-test on paired per-run differences.
-
-    Repeated k-fold runs share training data, so a plain t-test understates the
-    variance and calls differences significant that a rerun would not reproduce.
-    The correction inflates it by (1/n + n_test/n_train).
-
-    Returns (mean difference, t, two-sided p). At this n, p is indicative.
-    """
-    d = np.asarray(diffs, dtype=float)
-    n = len(d)
-    mean = float(d.mean())
-    if n < 2:
-        return mean, float("nan"), float("nan")
-    var = float(d.var(ddof=1))
-    if var == 0.0:
-        return mean, float("nan"), (1.0 if mean == 0.0 else 0.0)
-    t = mean / np.sqrt(var * (1.0 / n + n_test / max(n_train, 1)))
-    return mean, float(t), float(2 * stats.t.sf(abs(t), df=n - 1))
+# moved to corrected_test.py so combine_results.py need not import torch
 
 
 def _make_folds(y, patient, k, seed=0):
