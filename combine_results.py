@@ -30,6 +30,26 @@ def load_parts(paths):
     return parts
 
 
+def run_order(parts):
+    """Indices of `parts` in (seed, fold) order.
+
+    Every arm must be concatenated the same way or the paired test compares
+    unlike runs. Ordering by seed alone would leave the fold-split parts of one
+    seed in filesystem order, which agrees between arms only by accident, and
+    mispaired scores fail silently.
+    """
+    def part_key(d):
+        return min((r["seed"], r.get("fold") if r.get("fold") is not None else 0)
+                   for r in d["runs"])
+    return sorted(range(len(parts)), key=lambda i: part_key(parts[i]))
+
+
+def stacked(parts, order, arm, field):
+    """One arm's per-run scores, concatenated in run_order."""
+    return np.concatenate([np.array(parts[i]["scores"][arm][field])
+                           for i in order])
+
+
 def check_compatible(parts):
     """Refuse to merge parts that are not the same experiment."""
     ref = parts[0]
@@ -98,17 +118,10 @@ def main():
     print(f"class counts {ref['class_counts']}")
     print(f"folds={ref['folds']} epochs={ref['epochs']}\n")
 
-    # Concatenate in (seed, fold) order so every arm keeps the same run ordering
-    # and the paired test compares like with like. Ordering by seed alone would
-    # leave fold-split parts of one seed in filesystem order, which differs
-    # between arms only by accident -- and mispaired scores fail silently.
-    def part_key(d):
-        return min((r["seed"], r.get("fold") if r.get("fold") is not None else 0)
-                   for r in d["runs"])
-    order = sorted(range(len(parts)), key=lambda i: part_key(parts[i]))
+    order = run_order(parts)
+
     def stack(arm, field):
-        return np.concatenate([np.array(parts[i]["scores"][arm][field])
-                               for i in order])
+        return stacked(parts, order, arm, field)
 
     n_te = float(np.mean([r["n_test"] for d in parts for r in d["runs"]]))
     n_tr = float(np.mean([d["n_train_mean"] for d in parts]))
