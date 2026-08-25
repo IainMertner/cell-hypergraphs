@@ -922,7 +922,7 @@ def main():
         sc, f1 = eval_arm(arm)
         per_arm[arm] = {"acc": sc.tolist(), "f1": f1.tolist()}
         beat = float((sc > ab).mean())
-        mean_d, _t, p = corrected_t_test(sc - ab, n_te, n_tr)
+        mean_d, _t, p, _half = corrected_t_test(sc - ab, n_te, n_tr)
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
         print(f"  {arm:<18} acc {sc.mean():.3f} +- {sc.std():.3f}"
               f" | macroF1 {f1.mean():.3f}")

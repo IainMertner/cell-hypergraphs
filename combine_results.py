@@ -154,10 +154,12 @@ def main():
         # majority class keeps a respectable accuracy while its macro-F1 falls,
         # so accuracy is the metric least sensitive to the failure that matters.
         beat = float((f1 > ab_f1).mean())
-        mean_d, _t, p = corrected_t_test(f1 - ab_f1, n_te, n_tr)
+        mean_d, _t, p, half = corrected_t_test(f1 - ab_f1, n_te, n_tr)
         sig = "n/a" if np.isnan(p) else f"p={p:.3f}"
         print(_line(arm, f1.mean(), f1.std(), sc.mean()))
-        print(f"  {'':<18} vs {base} {mean_d:+.3f} ({sig}, corrected) "
+        ci = ("" if half != half            # NaN at n < 2
+              else f" [{mean_d - half:+.3f}, {mean_d + half:+.3f}]")
+        print(f"  {'':<18} vs {base} {mean_d:+.3f}{ci} ({sig}, corrected) "
               f"| wins {beat:.0%} of paired runs")
         summary["arms"][arm] = dict(
             acc=float(sc.mean()), acc_sd=float(sc.std()),
