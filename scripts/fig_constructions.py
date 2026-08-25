@@ -199,48 +199,39 @@ def main():
         centre = np.array([m.mean(axis=0) for m in members])
         chosen, remaining = [0], list(range(1, n_he))
         while len(chosen) < min(args.n_hyperedges, n_he) and remaining:
-            # farthest-point sampling, so the groups drawn overlap as little as
+            # farthest-point sampling, so the discs drawn overlap as little as
             # the construction allows
             d = np.min([np.linalg.norm(centre[remaining] - centre[c], axis=1)
                         for c in chosen], axis=0)
             chosen.append(remaining.pop(int(np.argmax(d))))
         shown = chosen
 
-    # Draw the MEMBERS, not the disc that defined them, and pad in DATA units.
-    # A stroke width given in points has no relation to the data scale: at any
-    # given figure size it reaches an arbitrary distance across the plot, so a
-    # two-cell blob swallows nearby non-members and hides the smaller blobs
-    # beneath it. Both look like the construction is wrong when it is the
-    # drawing that is.
-    #
-    # The rounded hull is the convex hull of a ring of points at radius `pad`
-    # about every member. That encloses exactly the members plus a fixed margin,
-    # gives a capsule for two members and a rounded polygon for more, and is
-    # entirely in data coordinates.
-    nn = cKDTree(pos).query(pos, k=2)[0][:, 1]
-    pad = args.pad * float(np.median(nn))
-    ring_pts = np.stack([np.cos(np.linspace(0, 2 * np.pi, 17)[:-1]),
-                         np.sin(np.linspace(0, 2 * np.pi, 17)[:-1])], axis=1) * pad
+    # Each hyperedge is drawn as the disc that defines it: radius r about its
+    # generating cell. The generator cannot be assumed to be cell e --
+    # incidences_from_groups drops singletons and renumbers, so hyperedge e is
+    # the e-th cell that had a neighbour. Getting that wrong centres every disc
+    # on the wrong cell, which is what made groups appear to contain one cell.
+    # Recover it instead: the generator is the member whose radius ball IS the
+    # member set.
+    balls = [frozenset(v) for v in cKDTree(pos).query_ball_point(pos, r=radius_px)]
+    generator = []
+    for mem in members:
+        want = frozenset(np.flatnonzero(
+            (pos[:, None] == mem[None]).all(-1).any(1)).tolist())
+        gen = [c for c in want if balls[c] == want]
+        assert gen, "no member generates this hyperedge"
+        generator.append(gen[0])
 
-    def rounded_hull(mem):
-        cloud = (mem[:, None, :] + ring_pts[None, :, :]).reshape(-1, 2)
-        v = ConvexHull(cloud).vertices
-        return cloud[np.r_[v, v[0]]]
+    # a disc holds every cell within r of its centre, so a non-member inside one
+    # means the centre is wrong -- the exact failure this figure had before
+    for e, c in enumerate(generator):
+        assert balls[c] == frozenset(hi[0][hi[1] == e].tolist()),             f"hyperedge {e} does not match the ball of cell {c}"
 
-    fa = min(0.18, 2.4 / max(len(shown), 1))
-    intruders = 0
+    fa = min(0.13, 1.6 / max(len(shown), 1))
     for e in shown:
-        mem = members[e]
-        ring = rounded_hull(mem)
-        ax.fill(ring[:, 0], ring[:, 1], facecolor="#2980b9", alpha=fa,
-                edgecolor="#2980b9", linewidth=0.9, zorder=1)
-        # a blob that encloses a cell it does not contain misreports membership
-        inside = np.array([_in_hull(ring, q) for q in pos])
-        inside[hi[0][hi[1] == e]] = False
-        intruders += int(inside.sum())
-    if intruders:
-        print(f"  NOTE: {intruders} cell(s) fall inside a group they do not "
-              f"belong to; lower --pad")
+        ax.add_patch(Circle(pos[generator[e]], radius_px, facecolor="#2980b9",
+                            alpha=fa, edgecolor="#2980b9", linewidth=0.9,
+                            zorder=1))
 
     draw_nodes(ax, pos, types, args.node_size)
     finish(ax, "hypergraph")
