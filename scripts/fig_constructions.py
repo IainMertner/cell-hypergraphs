@@ -22,7 +22,7 @@ import os
 import sys
 
 import numpy as np
-from scipy.spatial import cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -95,7 +95,11 @@ def finish(ax, title):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cells", default=None, help="a cells_cache.npz")
-    ap.add_argument("--n", type=int, default=28, help="cells to show")
+    ap.add_argument("--n-cells", "--n", type=int, default=28, dest="n",
+                    help="how many CELLS the patch holds. Edges and hyperedges "
+                         "follow from the construction: at the cohort's mean "
+                         "degree of 3.3 expect about 1.6 edges per cell and at "
+                         "most one hyperedge per cell")
     ap.add_argument("--radius-um", type=float, default=PARAMS["hg_radius_um"])
     ap.add_argument("--n-hyperedges", type=int, default=5,
                     help="how many of the one-per-cell hyperedges to draw. "
@@ -134,9 +138,15 @@ def main():
     ei = g.edge_index.numpy()
     hi = h.hyperedge_index.numpy()
     deg = ei.shape[1] / max(len(pos), 1)
-    card = np.bincount(hi[1])
-    print(f"{len(pos)} cells | {ei.shape[1] // 2} edges | mean degree {deg:.1f} "
-          f"| hyperedge cardinality median {int(np.median(card))} max {card.max()}")
+    card = np.bincount(hi[1]) if hi.size else np.array([0])
+    n_he = int(hi[1].max()) + 1 if hi.size else 0
+    print(f"{len(pos)} cells | {ei.shape[1] // 2} edges | {n_he} hyperedges "
+          f"| mean degree {deg:.1f} | cardinality median "
+          f"{int(np.median(card))} max {card.max()}")
+    if n_he > ei.shape[1] // 2:
+        print("  NOTE: more hyperedges than edges, which happens below mean "
+              "degree 2 -- cells pairing off give one edge and two hyperedges. "
+              "The patch is sparser than the cohort.")
     if deg < 1.0:
         print("  WARNING: mean degree under 1 -- this patch is sparser than the "
               "cohort's 3.3, try another --seed")
@@ -159,34 +169,53 @@ def main():
 
     # ---- 3.2 hypergraph, SAME positions and limits
     fig, ax = plt.subplots(figsize=(4.2, 4.2))
-    # hg_radius builds one hyperedge per cell in cell order, but
-    # incidences_from_groups DROPS singletons and renumbers what is left, so
-    # hyperedge j is the j-th cell that had a neighbour -- not cell j. Centring
-    # a disc on pos[j] therefore puts it on the wrong cell as soon as any
-    # earlier cell was isolated. Recover the mapping the same way the
-    # construction built it.
-    counts = np.array([len(v) for v in
-                       cKDTree(pos).query_ball_point(pos, r=radius_px)])
-    generator = np.flatnonzero(counts >= 2)      # hyperedge j <- cell gen[j]
-    assert len(generator) == int(hi[1].max()) + 1 if hi.size else True
-    shown = list(range(len(generator)))
+    # Membership is read straight off the incidence matrix. Reconstructing
+    # which cell generated which hyperedge is not possible from the cache:
+    # incidences_from_groups drops singletons and renumbers what survives, so
+    # hyperedge j is the j-th cell that had a neighbour, not cell j. Rebuilding
+    # that mapping from a fresh radius query got it wrong by however many cells
+    # had been dropped, and every group was drawn centred on the wrong cell --
+    # which is how a hyperedge came to appear to contain one cell when the
+    # construction guarantees at least two.
+    n_he = int(hi[1].max()) + 1 if hi.size else 0
+    members = [pos[hi[0][hi[1] == e]] for e in range(n_he)]
+    assert all(len(m) >= 2 for m in members), "singleton hyperedge in the cache"
+
+    shown = list(range(n_he))
     if args.n_hyperedges:
-        chosen, remaining = [shown[0]], shown[1:]
-        while len(chosen) < min(args.n_hyperedges, len(shown)) and remaining:
-            # farthest-point sampling, so the discs drawn overlap as little as
+        centre = np.array([m.mean(axis=0) for m in members])
+        chosen, remaining = [0], list(range(1, n_he))
+        while len(chosen) < min(args.n_hyperedges, n_he) and remaining:
+            # farthest-point sampling, so the groups drawn overlap as little as
             # the construction allows
-            d = np.min([np.linalg.norm(pos[generator[remaining]]
-                                       - pos[generator[c]], axis=1)
+            d = np.min([np.linalg.norm(centre[remaining] - centre[c], axis=1)
                         for c in chosen], axis=0)
-            k = int(np.argmax(d))
-            chosen.append(remaining.pop(k))
+            chosen.append(remaining.pop(int(np.argmax(d))))
         shown = chosen
+
+    # Draw the MEMBERS, not the disc that defined them. A two-cell hyperedge
+    # rendered as a 12.5um disc is a large circle with one dot near its centre
+    # and one on its rim, which reads as a group of one: the defining region is
+    # not the set. A hull through the members says exactly which cells belong.
+    fa = min(0.16, 2.2 / max(len(shown), 1))
     for e in shown:
-        # stacked fills compound to opaque, so thin them as the count rises
-        fa = min(0.13, 1.6 / max(len(shown), 1))
-        ax.add_patch(Circle(pos[generator[e]], radius_px,
-                            facecolor="#2980b9", alpha=fa,
-                            edgecolor="#2980b9", linewidth=0.9, zorder=1))
+        mem = members[e]
+        if len(mem) >= 3:
+            try:
+                order = ConvexHull(mem).vertices
+                ring = mem[np.r_[order, order[0]]]
+            except QhullError:                      # collinear members
+                ring = mem[np.argsort(mem[:, 0])]
+        else:
+            ring = mem
+        # a thick round-joined stroke pads the hull outward, so the blob encloses
+        # its member markers rather than passing through their centres
+        ax.plot(ring[:, 0], ring[:, 1], color="#2980b9", linewidth=11,
+                alpha=min(1.0, fa * 1.6), solid_capstyle="round",
+                solid_joinstyle="round", zorder=1)
+        if len(ring) >= 3:
+            ax.fill(ring[:, 0], ring[:, 1], color="#2980b9", alpha=fa, zorder=1)
+
     draw_nodes(ax, pos, types, args.node_size)
     finish(ax, "hypergraph")
     ax.set_xlim(pos[:, 0].min() - pad, pos[:, 0].max() + pad)
