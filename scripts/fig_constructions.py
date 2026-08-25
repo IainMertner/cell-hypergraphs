@@ -75,11 +75,11 @@ def pick_patch(centroids, n_target, radius_px, seed, target_degree=3.3,
     return m
 
 
-def draw_nodes(ax, pos, types):
+def draw_nodes(ax, pos, types, size=70):
     for t in range(len(TYPE_NAMES)):
         m = types == t + 1 if types.max() > 0 else types == t
         if m.any():
-            ax.scatter(pos[m, 0], pos[m, 1], s=70, zorder=3,
+            ax.scatter(pos[m, 0], pos[m, 1], s=size, zorder=3,
                        color=TYPE_COLOURS[t], edgecolor="white", linewidth=0.8,
                        label=TYPE_NAMES[t])
 
@@ -103,6 +103,10 @@ def main():
                          "useful node count is an unreadable pile of overlapping "
                          "discs; a spread-out handful shows what a hyperedge IS, "
                          "which is what the figure is for. 0 draws all of them")
+    ap.add_argument("--node-size", type=float, default=34,
+                    help="marker area. At 12.5 um the radius is about one cell "
+                         "spacing, so edges are short: large markers hide them "
+                         "and the graph reads as unconnected when it is not")
     ap.add_argument("--target-degree", type=float, default=3.3,
                     help="mean degree the patch should show. The cohort's value "
                          "at 12.5 um; a patch far from it is not representative")
@@ -145,8 +149,8 @@ def main():
     fig, ax = plt.subplots(figsize=(4.2, 4.2))
     for a, b in ei.T[ei[0] < ei[1]]:
         ax.plot(pos[[a, b], 0], pos[[a, b], 1], color="#34495e",
-                linewidth=1.0, alpha=0.7, zorder=1)
-    draw_nodes(ax, pos, types)
+                linewidth=1.4, alpha=0.85, zorder=1)
+    draw_nodes(ax, pos, types, args.node_size)
     finish(ax, "pairwise graph")
     ax.set_xlim(pos[:, 0].min() - pad, pos[:, 0].max() + pad)
     ax.set_ylim(pos[:, 1].min() - pad, pos[:, 1].max() + pad)
@@ -155,25 +159,35 @@ def main():
 
     # ---- 3.2 hypergraph, SAME positions and limits
     fig, ax = plt.subplots(figsize=(4.2, 4.2))
-    # hg_radius builds one hyperedge per cell IN CELL ORDER, so hyperedge e is
-    # exactly the disc of radius r about cell e -- drawing that disc is the
-    # construction itself rather than a hull fitted to its members
-    shown = [i for i in range(len(pos))
-             if (hi[1] == i).sum() >= 2] if args.n_hyperedges != 1 else []
+    # hg_radius builds one hyperedge per cell in cell order, but
+    # incidences_from_groups DROPS singletons and renumbers what is left, so
+    # hyperedge j is the j-th cell that had a neighbour -- not cell j. Centring
+    # a disc on pos[j] therefore puts it on the wrong cell as soon as any
+    # earlier cell was isolated. Recover the mapping the same way the
+    # construction built it.
+    counts = np.array([len(v) for v in
+                       cKDTree(pos).query_ball_point(pos, r=radius_px)])
+    generator = np.flatnonzero(counts >= 2)      # hyperedge j <- cell gen[j]
+    assert len(generator) == int(hi[1].max()) + 1 if hi.size else True
+    shown = list(range(len(generator)))
     if args.n_hyperedges:
         chosen, remaining = [shown[0]], shown[1:]
         while len(chosen) < min(args.n_hyperedges, len(shown)) and remaining:
             # farthest-point sampling, so the discs drawn overlap as little as
             # the construction allows
-            d = np.min([np.linalg.norm(pos[remaining] - pos[c], axis=1)
+            d = np.min([np.linalg.norm(pos[generator[remaining]]
+                                       - pos[generator[c]], axis=1)
                         for c in chosen], axis=0)
             k = int(np.argmax(d))
             chosen.append(remaining.pop(k))
         shown = chosen
     for e in shown:
-        ax.add_patch(Circle(pos[e], radius_px, facecolor="#2980b9", alpha=0.13,
-                            edgecolor="#2980b9", linewidth=1.0, zorder=1))
-    draw_nodes(ax, pos, types)
+        # stacked fills compound to opaque, so thin them as the count rises
+        fa = min(0.13, 1.6 / max(len(shown), 1))
+        ax.add_patch(Circle(pos[generator[e]], radius_px,
+                            facecolor="#2980b9", alpha=fa,
+                            edgecolor="#2980b9", linewidth=0.9, zorder=1))
+    draw_nodes(ax, pos, types, args.node_size)
     finish(ax, "hypergraph")
     ax.set_xlim(pos[:, 0].min() - pad, pos[:, 0].max() + pad)
     ax.set_ylim(pos[:, 1].min() - pad, pos[:, 1].max() + pad)
