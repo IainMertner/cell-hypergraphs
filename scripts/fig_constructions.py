@@ -94,7 +94,8 @@ def draw_nodes(ax, pos, types, size=70):
 
 
 def finish(ax, title):
-    ax.set_title(title)
+    # the arm names as the writeup uses them, so figure and text agree
+    ax.set_title(title, fontweight="bold")
     ax.set_aspect("equal")
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values():
@@ -120,7 +121,7 @@ def main():
                     help="blob margin, as a fraction of the median "
                          "nearest-neighbour distance. Too large and a group "
                          "encloses cells it does not contain")
-    ap.add_argument("--node-size", type=float, default=34,
+    ap.add_argument("--node-size", type=float, default=55,
                     help="marker area. At 12.5 um the radius is about one cell "
                          "spacing, so edges are short: large markers hide them "
                          "and the graph reads as unconnected when it is not")
@@ -139,10 +140,16 @@ def main():
                        target_degree=args.target_degree)
         pos, types = centroids[m].astype(float), types[m]
     else:
-        rng = np.random.default_rng(args.seed)
-        pos = rng.uniform(0, 100, size=(args.n, 2))
-        types = rng.integers(1, len(TYPE_NAMES) + 1, size=args.n)
+        # scale the box with n so density -- and therefore mean degree -- is
+        # held at the cohort's value whatever n is. A fixed box would make the
+        # preview sparser the fewer cells were asked for, which says nothing
+        # about the real construction
         radius_px = 22.0
+        rng = np.random.default_rng(args.seed)
+        side = float(np.sqrt(args.n * np.pi * radius_px ** 2
+                             / max(args.target_degree, 0.1)))
+        pos = rng.uniform(0, side, size=(args.n, 2))
+        types = rng.integers(1, len(TYPE_NAMES) + 1, size=args.n)
         print("no --cells given: synthetic points, schematic only")
 
     # the experiments' own constructions, so the figure cannot drift from them
@@ -174,7 +181,7 @@ def main():
         ax.plot(pos[[a, b], 0], pos[[a, b], 1], color="#34495e",
                 linewidth=1.4, alpha=0.85, zorder=1)
     draw_nodes(ax, pos, types, args.node_size)
-    finish(ax, "pairwise graph")
+    finish(ax, "pw-radius")
     ax.set_xlim(pos[:, 0].min() - pad, pos[:, 0].max() + pad)
     ax.set_ylim(pos[:, 1].min() - pad, pos[:, 1].max() + pad)
     fig.tight_layout()
@@ -234,7 +241,7 @@ def main():
                             zorder=1))
 
     draw_nodes(ax, pos, types, args.node_size)
-    finish(ax, "hypergraph")
+    finish(ax, "hg-radius")
     ax.set_xlim(pos[:, 0].min() - pad, pos[:, 0].max() + pad)
     ax.set_ylim(pos[:, 1].min() - pad, pos[:, 1].max() + pad)
     fig.tight_layout()
