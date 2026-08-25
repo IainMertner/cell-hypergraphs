@@ -75,6 +75,15 @@ def pick_patch(centroids, n_target, radius_px, seed, target_degree=3.3,
     return m
 
 
+def _in_hull(ring, q):
+    """Is q inside the closed convex polygon `ring`? Sign of the cross product
+    at every edge, which is enough because a rounded hull is convex."""
+    d = ring[1:] - ring[:-1]
+    w = q - ring[:-1]
+    c = d[:, 0] * w[:, 1] - d[:, 1] * w[:, 0]
+    return bool((c >= -1e-9).all() or (c <= 1e-9).all())
+
+
 def draw_nodes(ax, pos, types, size=70):
     for t in range(len(TYPE_NAMES)):
         m = types == t + 1 if types.max() > 0 else types == t
@@ -107,6 +116,10 @@ def main():
                          "useful node count is an unreadable pile of overlapping "
                          "discs; a spread-out handful shows what a hyperedge IS, "
                          "which is what the figure is for. 0 draws all of them")
+    ap.add_argument("--pad", type=float, default=0.35,
+                    help="blob margin, as a fraction of the median "
+                         "nearest-neighbour distance. Too large and a group "
+                         "encloses cells it does not contain")
     ap.add_argument("--node-size", type=float, default=34,
                     help="marker area. At 12.5 um the radius is about one cell "
                          "spacing, so edges are short: large markers hide them "
@@ -193,28 +206,41 @@ def main():
             chosen.append(remaining.pop(int(np.argmax(d))))
         shown = chosen
 
-    # Draw the MEMBERS, not the disc that defined them. A two-cell hyperedge
-    # rendered as a 12.5um disc is a large circle with one dot near its centre
-    # and one on its rim, which reads as a group of one: the defining region is
-    # not the set. A hull through the members says exactly which cells belong.
-    fa = min(0.16, 2.2 / max(len(shown), 1))
+    # Draw the MEMBERS, not the disc that defined them, and pad in DATA units.
+    # A stroke width given in points has no relation to the data scale: at any
+    # given figure size it reaches an arbitrary distance across the plot, so a
+    # two-cell blob swallows nearby non-members and hides the smaller blobs
+    # beneath it. Both look like the construction is wrong when it is the
+    # drawing that is.
+    #
+    # The rounded hull is the convex hull of a ring of points at radius `pad`
+    # about every member. That encloses exactly the members plus a fixed margin,
+    # gives a capsule for two members and a rounded polygon for more, and is
+    # entirely in data coordinates.
+    nn = cKDTree(pos).query(pos, k=2)[0][:, 1]
+    pad = args.pad * float(np.median(nn))
+    ring_pts = np.stack([np.cos(np.linspace(0, 2 * np.pi, 17)[:-1]),
+                         np.sin(np.linspace(0, 2 * np.pi, 17)[:-1])], axis=1) * pad
+
+    def rounded_hull(mem):
+        cloud = (mem[:, None, :] + ring_pts[None, :, :]).reshape(-1, 2)
+        v = ConvexHull(cloud).vertices
+        return cloud[np.r_[v, v[0]]]
+
+    fa = min(0.18, 2.4 / max(len(shown), 1))
+    intruders = 0
     for e in shown:
         mem = members[e]
-        if len(mem) >= 3:
-            try:
-                order = ConvexHull(mem).vertices
-                ring = mem[np.r_[order, order[0]]]
-            except QhullError:                      # collinear members
-                ring = mem[np.argsort(mem[:, 0])]
-        else:
-            ring = mem
-        # a thick round-joined stroke pads the hull outward, so the blob encloses
-        # its member markers rather than passing through their centres
-        ax.plot(ring[:, 0], ring[:, 1], color="#2980b9", linewidth=11,
-                alpha=min(1.0, fa * 1.6), solid_capstyle="round",
-                solid_joinstyle="round", zorder=1)
-        if len(ring) >= 3:
-            ax.fill(ring[:, 0], ring[:, 1], color="#2980b9", alpha=fa, zorder=1)
+        ring = rounded_hull(mem)
+        ax.fill(ring[:, 0], ring[:, 1], facecolor="#2980b9", alpha=fa,
+                edgecolor="#2980b9", linewidth=0.9, zorder=1)
+        # a blob that encloses a cell it does not contain misreports membership
+        inside = np.array([_in_hull(ring, q) for q in pos])
+        inside[hi[0][hi[1] == e]] = False
+        intruders += int(inside.sum())
+    if intruders:
+        print(f"  NOTE: {intruders} cell(s) fall inside a group they do not "
+              f"belong to; lower --pad")
 
     draw_nodes(ax, pos, types, args.node_size)
     finish(ax, "hypergraph")
