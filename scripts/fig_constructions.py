@@ -22,6 +22,7 @@ import os
 import sys
 
 import numpy as np
+from scipy.spatial import cKDTree
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -37,24 +38,26 @@ TYPE_NAMES = ["neoplastic", "inflammatory", "connective", "dead", "epithelial"]
 TYPE_COLOURS = ["#c0392b", "#2980b9", "#27ae60", "#7f8c8d", "#8e44ad"]
 
 
-def pick_window(centroids, n_target, seed):
-    """A small square window holding roughly n_target cells.
+def pick_patch(centroids, n_target, seed):
+    """The n_target cells nearest a randomly chosen cell.
 
-    Chosen at random rather than by density: the densest window would show
-    hyperedges at their largest and misrepresent the median cardinality of six
-    that the text reports.
+    Sampling a WINDOW uniformly over the slide picks mostly background: a slide
+    is largely fat, stroma and empty glass, so a random window holds a handful
+    of isolated cells and shows a construction with almost no edges, which at a
+    mean degree of about 3.3 is not what the radius graph looks like anywhere it
+    matters. Sampling a CELL and taking its neighbours lands in tissue by
+    construction.
+
+    It is also the right weighting. Cell-weighted sampling favours dense areas
+    exactly as often as cells occur in them, which is how the median hyperedge
+    cardinality quoted in the text is computed -- over cells, not over area.
     """
     rng = np.random.default_rng(seed)
-    lo, hi = centroids.min(axis=0), centroids.max(axis=0)
-    density = len(centroids) / max(np.prod(hi - lo), 1.0)
-    side = float(np.sqrt(n_target / max(density, 1e-12)))
-    for _ in range(200):
-        x0 = rng.uniform(lo[0], max(hi[0] - side, lo[0] + 1))
-        y0 = rng.uniform(lo[1], max(hi[1] - side, lo[1] + 1))
-        m = ((centroids[:, 0] >= x0) & (centroids[:, 0] < x0 + side) &
-             (centroids[:, 1] >= y0) & (centroids[:, 1] < y0 + side))
-        if n_target * 0.6 <= m.sum() <= n_target * 1.6:
-            return m
+    tree = cKDTree(centroids)
+    i = int(rng.integers(len(centroids)))
+    _d, idx = tree.query(centroids[i], k=min(n_target, len(centroids)))
+    m = np.zeros(len(centroids), dtype=bool)
+    m[np.atleast_1d(idx)] = True
     return m
 
 
@@ -93,7 +96,7 @@ def main():
 
     if args.cells:
         centroids, types, mpp, _morph = load_cache(args.cells)
-        m = pick_window(centroids, args.n, args.seed)
+        m = pick_patch(centroids, args.n, args.seed)
         pos, types = centroids[m].astype(float), types[m]
         radius_px = microns_to_px(args.radius_um, mpp)
     else:
@@ -108,8 +111,13 @@ def main():
     h = hg_radius.build(pos, types, radius_px, None, PARAMS["max_size"])
     ei = g.edge_index.numpy()
     hi = h.hyperedge_index.numpy()
-    print(f"{len(pos)} cells | {ei.shape[1] // 2} edges | "
-          f"{int(hi[1].max()) + 1} hyperedges")
+    deg = ei.shape[1] / max(len(pos), 1)
+    card = np.bincount(hi[1])
+    print(f"{len(pos)} cells | {ei.shape[1] // 2} edges | mean degree {deg:.1f} "
+          f"| hyperedge cardinality median {int(np.median(card))} max {card.max()}")
+    if deg < 1.0:
+        print("  WARNING: mean degree under 1 -- this patch is sparser than the "
+              "cohort's 3.3, try another --seed")
 
     os.makedirs(args.out, exist_ok=True)
     span = pos.max(axis=0) - pos.min(axis=0)
