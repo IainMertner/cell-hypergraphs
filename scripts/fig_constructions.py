@@ -38,26 +38,40 @@ TYPE_NAMES = ["neoplastic", "inflammatory", "connective", "dead", "epithelial"]
 TYPE_COLOURS = ["#c0392b", "#2980b9", "#27ae60", "#7f8c8d", "#8e44ad"]
 
 
-def pick_patch(centroids, n_target, seed):
-    """The n_target cells nearest a randomly chosen cell.
+def pick_patch(centroids, n_target, radius_px, seed, target_degree=3.3,
+               tries=300):
+    """A patch of n_target cells whose density matches the cohort's.
 
-    Sampling a WINDOW uniformly over the slide picks mostly background: a slide
-    is largely fat, stroma and empty glass, so a random window holds a handful
-    of isolated cells and shows a construction with almost no edges, which at a
-    mean degree of about 3.3 is not what the radius graph looks like anywhere it
-    matters. Sampling a CELL and taking its neighbours lands in tissue by
-    construction.
+    Taking the n cells nearest a random one fixes the COUNT but not the AREA,
+    so in a sparse part of a slide those n cells span hundreds of microns and
+    almost none fall within the radius of each other -- a figure of isolated
+    dots, which is not what the construction looks like anywhere it is used.
+    A typical region holds about 6,000 cells per square millimetre, a mean
+    spacing near the 12.5 um radius itself, which is why the mean degree over
+    the cohort is about 3.3.
 
-    It is also the right weighting. Cell-weighted sampling favours dense areas
-    exactly as often as cells occur in them, which is how the median hyperedge
-    cardinality quoted in the text is computed -- over cells, not over area.
+    Candidates are therefore scored on the degree they would produce and the
+    closest to the cohort mean is kept. Targeting the mean rather than the
+    maximum matters: the densest patch would show hyperedges at their largest
+    and misrepresent the median cardinality the text reports.
     """
     rng = np.random.default_rng(seed)
     tree = cKDTree(centroids)
-    i = int(rng.integers(len(centroids)))
-    _d, idx = tree.query(centroids[i], k=min(n_target, len(centroids)))
+    k = min(n_target, len(centroids))
+    best = None
+    for _ in range(tries):
+        i = int(rng.integers(len(centroids)))
+        _d, idx = tree.query(centroids[i], k=k)
+        idx = np.atleast_1d(idx)
+        pts = centroids[idx]
+        pairs = cKDTree(pts).query_pairs(r=radius_px)
+        deg = 2 * len(pairs) / k
+        score = abs(deg - target_degree)
+        if best is None or score < best[0]:
+            best = (score, idx, deg)
     m = np.zeros(len(centroids), dtype=bool)
-    m[np.atleast_1d(idx)] = True
+    m[best[1]] = True
+    print(f"patch mean degree {best[2]:.1f} (cohort ~{target_degree})")
     return m
 
 
@@ -89,6 +103,9 @@ def main():
                          "useful node count is an unreadable pile of overlapping "
                          "discs; a spread-out handful shows what a hyperedge IS, "
                          "which is what the figure is for. 0 draws all of them")
+    ap.add_argument("--target-degree", type=float, default=3.3,
+                    help="mean degree the patch should show. The cohort's value "
+                         "at 12.5 um; a patch far from it is not representative")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="figs")
     ap.add_argument("--format", default="pdf")
@@ -96,9 +113,10 @@ def main():
 
     if args.cells:
         centroids, types, mpp, _morph = load_cache(args.cells)
-        m = pick_patch(centroids, args.n, args.seed)
-        pos, types = centroids[m].astype(float), types[m]
         radius_px = microns_to_px(args.radius_um, mpp)
+        m = pick_patch(centroids, args.n, radius_px, args.seed,
+                       target_degree=args.target_degree)
+        pos, types = centroids[m].astype(float), types[m]
     else:
         rng = np.random.default_rng(args.seed)
         pos = rng.uniform(0, 100, size=(args.n, 2))
