@@ -126,6 +126,10 @@ class DeepSetsHyperConv(nn.Module):
         if num_hyperedges is None:
             num_hyperedges = int(edge_idx.max()) + 1 if edge_idx.numel() else 0
         if num_hyperedges == 0:                       # degenerate region
+            # must still clear last_he: returning early with it unset leaves the
+            # PREVIOUS region's groups in place, which a group readout would
+            # then pool as if they belonged to this one
+            self.last_he = x.new_zeros((0, self.in_dim))
             return self._combine(x, torch.zeros_like(x))
         m = self.phi(x)
         he = scatter(m[node_idx], edge_idx, dim=0,
@@ -136,6 +140,12 @@ class DeepSetsHyperConv(nn.Module):
                            reduce="sum").unsqueeze(1)
             he = torch.cat([he, size.log1p()], dim=1)
         he = self.rho(he)
+        # The group vector is otherwise transient: it is scattered back to the
+        # member nodes and never referenced again, so nothing between it and the
+        # prediction ever sees a hyperedge. Keeping it lets the encoder pool over
+        # groups as well as cells -- the one thing a hypergraph offers that a
+        # pairwise graph has no analogue for.
+        self.last_he = he
         back = _back_by_family(he, node_idx, edge_idx, n, self.back,
                                family_id, self.n_families)
         if self.proj is not None:
@@ -414,20 +424,26 @@ class HyperRegionEncoder(nn.Module):
     # input -- the ablation twin of the pairwise "gin+deg", and off everywhere
     # else so that cardinality reaches the model through the structure rather
     # than as a hand-supplied feature.
-    # (layer, return-path aggregation, size channel, self/context combine, rho MLP)
-    AGGS = {"deepsets":       (DeepSetsHyperConv, "mean", False, "add", False),
-            "deepsets2":      (DeepSetsHyperConv, "sum",  False, "add", False),
-            "deepsets+size":  (DeepSetsHyperConv, "mean", True,  "add", False),
-            "deepsets2+size": (DeepSetsHyperConv, "sum",  True,  "add", False),
+    # (layer, return path, size channel, self/context combine, rho MLP, group readout)
+    AGGS = {"deepsets":       (DeepSetsHyperConv, "mean", False, "add", False, False),
+            "deepsets2":      (DeepSetsHyperConv, "sum",  False, "add", False, False),
+            "deepsets+size":  (DeepSetsHyperConv, "mean", True,  "add", False, False),
+            "deepsets2+size": (DeepSetsHyperConv, "sum",  True,  "add", False, False),
             # UNMATCHED: more general than GIN's combination, so it answers
             # "does a hypergraph layer win when unconstrained", not the
             # representational question the primary arms are built for
-            "deepsets2+cat":  (DeepSetsHyperConv, "sum",  False, "concat", False),
+            "deepsets2+cat":  (DeepSetsHyperConv, "sum",  False, "concat", False, False),
             # rho as a perceptron: the strictly section-3.5-compliant arm. Run
             # against deepsets2 to measure what the simplification costs
-            "deepsets2+mlp":  (DeepSetsHyperConv, "sum",  False, "add", True),
-            "sum":            (SumHyperConv, "mean", False, "add", False),
-            "sum2":           (SumHyperConv, "sum",  False, "add", False)}
+            "deepsets2+mlp":  (DeepSetsHyperConv, "sum",  False, "add", True, False),
+            # UNMATCHED: pools over hyperedges as well as cells, so the region is
+            # summarised by its groups and not only by its members. The pairwise
+            # arm has no counterpart -- GIN computes no edge representation -- so
+            # this answers "does the group representation help when it is
+            # actually used", not the matched question the primary arms are for
+            "deepsets2+group": (DeepSetsHyperConv, "sum", False, "add", False, True),
+            "sum":            (SumHyperConv, "mean", False, "add", False, False),
+            "sum2":           (SumHyperConv, "sum",  False, "add", False, False)}
 
     def __init__(self, in_dim, hidden, out_dim=REGION_DIM, agg=None,
                  n_families=1):
@@ -436,21 +452,31 @@ class HyperRegionEncoder(nn.Module):
         if agg not in self.AGGS:
             raise ValueError(f"unknown hypergraph agg {agg!r}; expected one of "
                              f"{sorted(self.AGGS)}")
-        Conv, back, use_size, combine, rho_mlp = self.AGGS[agg]
+        Conv, back, use_size, combine, rho_mlp, group = self.AGGS[agg]
         self.agg = agg
         self.n_families = n_families
+        self.group_readout = group
         kw = ({"use_size": use_size, "combine": combine, "rho_mlp": rho_mlp}
               if Conv is DeepSetsHyperConv else {})
         self.c1 = Conv(in_dim, hidden, back=back, n_families=n_families, **kw)
         self.c2 = Conv(hidden, hidden, back=back, n_families=n_families, **kw)
-        self.proj = nn.Linear(3 * hidden, out_dim)
+        # six moments rather than three when groups are pooled alongside cells
+        self.proj = nn.Linear((6 if group else 3) * hidden, out_dim)
         self.out_dim = out_dim
 
     def forward(self, x, hyperedge_index, batch, n_regions, num_hyperedges,
                 family_id=None):
         x = F.relu(self.c1(x, hyperedge_index, num_hyperedges, family_id))
         x = F.relu(self.c2(x, hyperedge_index, num_hyperedges, family_id))
-        return self.proj(_readout(x, batch, n_regions))
+        r = _readout(x, batch, n_regions)
+        if self.group_readout:
+            he = self.c2.last_he
+            # a hyperedge lies wholly within one region, so its region is that of
+            # any member; take the first incidence of each
+            he_batch = torch.zeros(he.size(0), dtype=torch.long, device=x.device)
+            he_batch.scatter_(0, hyperedge_index[1], batch[hyperedge_index[0]])
+            r = torch.cat([r, _readout(he, he_batch, n_regions)], dim=1)
+        return self.proj(r)
 
 
 # ------------------------------------------------------------ packing a slide
