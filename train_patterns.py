@@ -25,7 +25,7 @@ from corrected_test import corrected_t_test
 from graphs import N_TYPES, DEFAULT_ARMS
 from models import (set_seed, matched_hidden, n_params, macro_f1,
                     MILClassifier, AbundanceOnly, pack_bag, parse_arm,
-                    pack_mode)
+                    pack_mode, permute_within_regions)
 
 # 4-way and the collapsed spatial-only ("arrangement") mapping
 CLASSES4 = ["Brisk Diffuse", "Brisk Band-like", "Non-Brisk Focal", "Non-Brisk Multifocal"]
@@ -262,7 +262,7 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         idx = torch.as_tensor(np.asarray(chunk), device=labels_t.device).long()
         return float(class_weight[labels_t[idx]].sum())
 
-    def run(i, ab_i=None, bag_i=None):
+    def run(i, ab_i=None, bag_i=None, perm_struct=False):
         """Score slide i. ab_i/bag_i override WHICH slide each input comes from,
         which is how the permutation ablations are done."""
         if bags is None:                       # the abundance-only control
@@ -271,9 +271,13 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         # tensors rather than re-packing per call
         bag = [tuple(t.to(device) if torch.is_tensor(t) else t for t in g)
                for g in bags[i if bag_i is None else bag_i]]
+        if perm_struct:
+            bag = [permute_within_regions(g, gperm) for g in bag]
         a = None if abundance is None else abundance[i if ab_i is None else ab_i]
         return model(bag, a)[0]
 
+    # own stream, so the structure ablation cannot shift the training shuffle
+    gperm = torch.Generator().manual_seed(seed + 991)
     y_np = labels_t.detach().cpu().numpy()
     # survival carries (time, event) per slide where classification carries a
     # class index, so everything downstream reads these two instead of y_np
@@ -286,7 +290,12 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         return float(o.reshape(-1)[0]) if objective == "cox" else int(o.argmax())
 
     def preds(idx, src=None, what=None):
-        """src: parallel array of slides to take `what` ('ab'|'bag') from."""
+        """src: parallel array of slides to take `what` ('ab'|'bag') from.
+
+        what='struct' needs no src: it relabels a slide's own nodes rather than
+        borrowing another slide's input."""
+        if what == "struct":
+            return np.array([_out(i, perm_struct=True) for i in idx])
         if src is None:
             return np.array([_out(i) for i in idx])
         kw = "ab_i" if what == "ab" else "bag_i"
@@ -389,6 +398,10 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
                 abl["f1_abundance_permuted"] = _abl(pa)
             pg = preds(te, src=pr, what="bag")
             abl["f1_graph_permuted"] = _abl(pg)
+            # features, region membership and topology all held; only which
+            # cell sits where is destroyed, so a drop here is attributable to
+            # arrangement and not to composition at any scale
+            abl["f1_structure_permuted"] = _abl(preds(te, what="struct"))
         return acc, f1, stopped_at, best_epoch, abl
 
 

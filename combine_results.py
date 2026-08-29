@@ -195,6 +195,7 @@ def main():
             full = float(np.mean(m.get("f1_full", [float("nan")])))
             bits = []
             for key, lbl in (("f1_graph_permuted", "graph"),
+                             ("f1_structure_permuted", "structure"),
                              ("f1_abundance_permuted", "abundance")):
                 if key in m:
                     v = float(np.mean(m[key]))
@@ -204,6 +205,8 @@ def main():
                 full=full,
                 **{lbl: float(np.mean(m[key]))
                    for key, lbl in (("f1_graph_permuted", "graph_permuted"),
+                                    ("f1_structure_permuted",
+                                     "structure_permuted"),
                                     ("f1_abundance_permuted",
                                      "abundance_permuted")) if key in m})
         print("  a drop near zero means that input was not being used")

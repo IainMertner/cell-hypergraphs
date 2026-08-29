@@ -538,6 +538,39 @@ def pack_hyper(region_graphs):
             torch.cat(batch), len(region_graphs), edge_off, family_id)
 
 
+def permute_within_regions(chunk, generator):
+    """Relabel a packed chunk's nodes within each region, structure only.
+
+    Every other ablation replaces an input with another slide's, which for the
+    graph branch removes the node features along with the structure and so
+    cannot say which of the two the model was using. This one leaves the
+    features, the region membership and the topology exactly as they were, and
+    changes only WHICH cell sits at each position in the graph. A drop is
+    therefore attributable to the correspondence between a cell and its
+    neighbourhood -- it cannot be explained by composition at any scale, since
+    the multiset of features in every region is untouched.
+
+    Permuting within regions rather than across the whole packed chunk matters:
+    a global permutation would connect cells in different regions, which changes
+    the topology instead of preserving it.
+    """
+    x, struct, batch = chunk[0], chunk[1], chunk[2]
+    perm = torch.empty_like(batch)
+    for r in range(int(batch.max()) + 1 if batch.numel() else 0):
+        idx = (batch == r).nonzero(as_tuple=True)[0]
+        # CPU randperm then move: a CPU generator with a CUDA device errors,
+        # and seeding per device would make the ablation depend on where it ran
+        order = torch.randperm(idx.numel(), generator=generator).to(idx.device)
+        perm[idx] = idx[order]
+    if struct.numel() == 0:
+        return chunk
+    new = struct.clone()
+    new[0] = perm[struct[0]]                 # node row, for both packings
+    if new.size(0) > 1 and chunk[1].size(0) == 2 and len(chunk) == 4:
+        new[1] = perm[struct[1]]             # pairwise: both rows are nodes
+    return (x, new) + tuple(chunk[2:])
+
+
 def pack_star(region_graphs):
     """Star-expand a slide's hypergraph regions into ONE bipartite graph.
 
