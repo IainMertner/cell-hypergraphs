@@ -538,7 +538,7 @@ def pack_hyper(region_graphs):
             torch.cat(batch), len(region_graphs), edge_off, family_id)
 
 
-def permute_within_regions(chunk, generator):
+def permute_within_regions(chunk, generator, mode):
     """Relabel a packed chunk's nodes within each region, structure only.
 
     Every other ablation replaces an input with another slide's, which for the
@@ -554,6 +554,14 @@ def permute_within_regions(chunk, generator):
     a global permutation would connect cells in different regions, which changes
     the topology instead of preserving it.
     """
+    if mode == "star":
+        # a star bag's node set includes one node per hyperedge, so permuting
+        # node ids would move hyperedge-nodes among cells and change what the
+        # graph means. Fail rather than guess.
+        raise NotImplementedError(
+            "structure permutation is not defined for star-packed bags")
+    if mode not in ("pw", "hyper"):
+        raise ValueError(f"unknown pack mode {mode!r}")
     x, struct, batch = chunk[0], chunk[1], chunk[2]
     perm = torch.empty_like(batch)
     for r in range(int(batch.max()) + 1 if batch.numel() else 0):
@@ -565,10 +573,10 @@ def permute_within_regions(chunk, generator):
     if struct.numel() == 0:
         return chunk
     new = struct.clone()
-    new[0] = perm[struct[0]]                 # node row, for both packings
-    if new.size(0) > 1 and chunk[1].size(0) == 2 and len(chunk) == 4:
-        new[1] = perm[struct[1]]             # pairwise: both rows are nodes
-    return (x, new) + tuple(chunk[2:])
+    new[0] = perm[struct[0]]                 # node row in both packings
+    if mode == "pw":
+        new[1] = perm[struct[1]]             # pairwise: the second row is also
+    return (x, new) + tuple(chunk[2:])       # a node; hyper's is an edge id
 
 
 def pack_star(region_graphs):

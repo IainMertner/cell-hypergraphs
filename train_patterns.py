@@ -210,7 +210,7 @@ def load_survival(csv_path):
 def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, seed,
                    abundance=None, device="cpu", patience=20, class_weight=None,
                    select_on="macro_f1", batch_size=8, progress_every=0,
-                   objective="ce", tag=""):
+                   objective="ce", bag_mode=None, tag=""):
     """Train on `tr`, early-stop on `va`, score `te`. Returns (accuracy, macro-F1).
 
     batch_size: slides per optimiser step. This was FULL BATCH -- gradients
@@ -272,7 +272,7 @@ def train_eval_mil(model, bags, labels_t, tr, va, te, n_classes, epochs, lr, see
         bag = [tuple(t.to(device) if torch.is_tensor(t) else t for t in g)
                for g in bags[i if bag_i is None else bag_i]]
         if perm_struct:
-            bag = [permute_within_regions(g, gperm) for g in bag]
+            bag = [permute_within_regions(g, gperm, bag_mode) for g in bag]
         a = None if abundance is None else abundance[i if ab_i is None else ab_i]
         return model(bag, a)[0]
 
@@ -880,6 +880,7 @@ def main():
                                    batch_size=args.batch_size,
                                    objective=("cox" if args.task == "survival"
                                               else "ce"),
+                                   bag_mode=pack_mode(arm),
                                    progress_every=args.progress_every,
                                    tag=f"[{arm}] {j}/{len(runs)} ")
             scores.append(r[:2])
