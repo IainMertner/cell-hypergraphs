@@ -66,6 +66,7 @@ for T in $(seq "$FIRST" "$LAST"); do
         ${PW_LAYERS:+--pw-layers $PW_LAYERS} \
         ${HIDDEN:+--hidden $HIDDEN} \
         ${LR:+--lr $LR} \
+        ${MMAP:+--mmap} \
         ${BATCH:+--batch-size $BATCH} \
         ${REGION_DIM:+--region-dim $REGION_DIM} \
         ${ATT_DIM:+--att-dim $ATT_DIM} \
