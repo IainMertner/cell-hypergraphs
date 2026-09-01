@@ -211,6 +211,44 @@ def main():
                                      "abundance_permuted")) if key in m})
         print("  a drop near zero means that input was not being used")
 
+        # How much MORE one arm depends on an input than the baseline does.
+        # Each part contributes one value per arm, appended in the same pass,
+        # so the lists are paired across arms by construction and the paired
+        # difference of drops is well defined per run. Comparing two mean drops
+        # by eye cannot say whether a gap of 0.014 differs from one of 0.054;
+        # this puts the same corrected test on it as everything else.
+        if base in abl:
+            base_full = np.array(abl[base].get("f1_full", []), dtype=float)
+            lines = []
+            for arm, m in abl.items():
+                if arm == base:
+                    continue
+                arm_full = np.array(m.get("f1_full", []), dtype=float)
+                if arm_full.shape != base_full.shape or not arm_full.size:
+                    continue
+                for key, lbl in (("f1_graph_permuted", "graph"),
+                                 ("f1_structure_permuted", "structure"),
+                                 ("f1_abundance_permuted", "abundance")):
+                    if key not in m or key not in abl[base]:
+                        continue
+                    d_arm = arm_full - np.array(m[key], dtype=float)
+                    d_base = base_full - np.array(abl[base][key], dtype=float)
+                    md, _t, pv, half = corrected_t_test(d_arm - d_base, n_te, n_tr)
+                    ci = ("" if half != half
+                          else f" [{md - half:+.3f}, {md + half:+.3f}]")
+                    sg = "n/a" if np.isnan(pv) else f"p={pv:.3f}"
+                    lines.append(f"  {arm:<28} {lbl:<9} {md:+.3f}{ci} ({sg})")
+                    summary["ablations"].setdefault(arm, {})[
+                        f"{lbl}_reliance_vs_baseline"] = float(md)
+            if lines:
+                print()
+                print(f"extra reliance on each input relative to {base}, "
+                      f"paired per run:")
+                for ln in lines:
+                    print(ln)
+                print("  positive = this arm's score falls further when that "
+                      "input is destroyed")
+
     if args.save:
         # A combined file from a different cohort is a different experiment.
         # Silently replacing one with the other is how a slide ends up quoting
